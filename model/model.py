@@ -39,14 +39,20 @@ class Block(nn.Module):
         self.hc = HyperConnection(text_cfg)
         self.engram = Engram(text_cfg, layer_id) if layer_id in text_cfg.engram_layer_ids else None
 
-    def forward(self, x, start_pos, pre_mix, shared, engram_hashes=None, token_mask=None):
+    def forward(self, x, start_pos, pre_mix, *attn_args, engram_hashes=None, token_mask=None):
+        """attn_args 透传给 attention（普通块传 shared 运行时；DSpark 块传 main_x）。
+
+        输入：x [B,L,hc,dim]；start_pos；pre_mix；attn_args；engram_hashes；token_mask。
+        输出：(x, ffn_pre)。
+        预期行为：attn 用上一层传的 pre_mix，FFN 用本层 attn 产的 pre_mix（single-pass 错位）。
+        """
         if self.engram is not None and engram_hashes is not None:
             x = self.engram(x, engram_hashes, token_mask)
         residual = x
         attn_pre, attn_post, attn_comb = self.hc.hc_mixes(x, "attn")
         h = self.hc.hc_pre(x, pre_mix)
         h = self.attn_norm(h)
-        h = self.attn(h, start_pos, shared)
+        h = self.attn(h, start_pos, *attn_args)
         x = self.hc.hc_post(h, residual, attn_post, attn_comb)
 
         residual = x
@@ -125,7 +131,8 @@ class Model(nn.Module):
             # 参考实现：在层处理**之前**取 hc 副本的均值（MTP 读的是注意力输入）
             if i in self.target_layer_ids:
                 main_hiddens.append(h.mean(dim=2))
-            h, pre_mix = layer(h, start_pos, pre_mix, self.shared, eh, token_mask)
+            h, pre_mix = layer(h, start_pos, pre_mix, self.shared,
+                               engram_hashes=eh, token_mask=token_mask)
 
         h = self.layers[-1].hc.hc_pre(h, pre_mix)  # 折叠成 1 份
         hidden = self.norm(h)

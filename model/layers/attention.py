@@ -17,6 +17,7 @@ from torch import nn
 from model.layers.compressor import Compressor
 from model.layers.indexer import Indexer, select_candidate_blocks
 from model.nn.norm import RMSNorm
+from model.nn.quant import fake_quant_compressed_kv, fake_quant_fp8
 from model.nn.rope import apply_rotary_emb
 
 
@@ -170,9 +171,10 @@ class Attention(nn.Module):
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
         apply_rotary_emb(q[..., -rd:], freqs)
 
-        # 滑窗 KV（每层自算）
+        # 滑窗 KV（每层自算）；参考实现对 KV 做 FP8 量化（act_quant, block=32, pow2）
         kv = self.kv_norm(self.wkv(x))
         apply_rotary_emb(kv[..., -rd:], freqs)
+        kv = fake_quant_fp8(kv, block_size=32, pow2=True)
         win = self.window_size
         if start_pos == 0:
             # 训练/prefill 直接用 kv（不写缓存，避免破坏计算图）；decode 才需要缓存
@@ -274,6 +276,8 @@ class Attention(nn.Module):
             else:
                 freqs = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
             apply_rotary_emb(latent[..., -rd:], freqs)
+            # 参考实现对压缩 latent 做 FP4 量化（fp4_act_quant, block=16, E4M3 scale）
+            latent = fake_quant_compressed_kv(latent, block_size=16)
             if start_pos == 0:
                 shared.compress_kv = latent   # 训练：带梯度共享给后续层
             else:

@@ -65,7 +65,7 @@ class PatchEmbed(nn.Module):
 
     def __init__(self, vision_cfg):
         super().__init__()
-        self.proj = Linear(3 * vision_cfg.patch_size**2, vision_cfg.hidden_size)
+        self.proj = Linear(3 * vision_cfg.patch_size**2, vision_cfg.hidden_size, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x [n_patches, 3, ps, ps] → [n_patches, dim]。"""
@@ -79,8 +79,8 @@ class VisionAttention(nn.Module):
         super().__init__()
         self.n_heads = vision_cfg.num_attention_heads
         self.head_dim = vision_cfg.hidden_size // self.n_heads
-        self.wqkv = Linear(vision_cfg.hidden_size, 3 * vision_cfg.hidden_size)
-        self.wo = Linear(vision_cfg.hidden_size, vision_cfg.hidden_size)
+        self.wqkv = Linear(vision_cfg.hidden_size, 3 * vision_cfg.hidden_size, bias=True)
+        self.wo = Linear(vision_cfg.hidden_size, vision_cfg.hidden_size, bias=True)
 
     def forward(self, x, cos, sin):
         n = x.size(0)
@@ -156,8 +156,9 @@ class Aligner(nn.Module):
         super().__init__()
         self.downsample_ratio = vision_cfg.downsample_ratio
         r = self.downsample_ratio
-        self.w1 = Linear(vision_cfg.hidden_size * r**2, lang_dim)
-        self.w2 = Linear(lang_dim, lang_dim)
+        # 参考实现用 nn.Linear（默认 bias=True）
+        self.w1 = Linear(vision_cfg.hidden_size * r**2, lang_dim, bias=True)
+        self.w2 = Linear(lang_dim, lang_dim, bias=True)
 
     def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
         r = self.downsample_ratio

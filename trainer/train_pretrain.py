@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from model.config import ModelConfig
 from model.train.data import PretrainDataset
 from model.model import Model
+from model.layers.indexer import IndexerLossAutoScaler
 from model.train.optim import make_optimizers
 from model.tokenizer import load_tokenizer
 
@@ -75,6 +76,8 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--router_bias_rate", type=float, default=1e-3,
+                        help="noaux_tc 纠正 bias 的更新步长（非梯度）")
     parser.add_argument("--max_seq_len", type=int, default=768)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_interval", type=int, default=10)

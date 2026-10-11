@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from model.nn.norm import RMSNorm
+from model.nn.quant import fake_quant_fp4
 
 
 def select_candidate_blocks(
@@ -78,9 +79,11 @@ class Indexer(nn.Module):
         """算每个 query 对每个压缩位置的分数。x [B,L,dim] → [B,L,T]。"""
         dtype = x.dtype
         q = self.wq_b(qr.to(self.wq_b.weight.dtype)).unflatten(-1, (self.n_heads, self.index_head_dim)).to(dtype)
+        # 参考实现对 indexer 的 q/k 做 FP4 量化（fp4_act_quant, block=32, E8M0 scale）
+        q = fake_quant_fp4(q, block_size=32)
         weights = self.weights_proj(x.to(self.weights_proj.weight.dtype)).to(dtype) \
             * (self.softmax_scale * self.n_heads**-0.5)
-        s = torch.einsum("bshd,btd->bsht", q, index_k.to(dtype))
+        s = torch.einsum("bshd,btd->bsht", q, fake_quant_fp4(index_k.to(dtype), block_size=32))
         return (s.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
     def indexer_loss(self, main_attn_dist: torch.Tensor, index_score: torch.Tensor,
@@ -135,3 +138,34 @@ class Indexer(nn.Module):
         topk = min(self.index_topk, end)
         idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
         return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+
+
+class IndexerLossAutoScaler(torch.autograd.Function):
+    """把 indexer loss 挂到某个输出张量上，不改变前向值，只在反向注入它的梯度。
+
+    参考实现做法（DSA indexer）：indexer 的 KL loss 不能直接 backward（会与主 loss 重复计入），
+    而是通过本 Function 挂在 attention 输出上——前向透传，反向把 indexer_loss 的梯度按
+    `main_loss_backward_scale` 缩放后回传，从而用同一个 backward 同时驱动主 loss 和 indexer loss。
+    """
+
+    main_loss_backward_scale: torch.Tensor | None = None
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, indexer_loss: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(indexer_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (indexer_loss,) = ctx.saved_tensors
+        loss_scale = IndexerLossAutoScaler.main_loss_backward_scale
+        if loss_scale is None:
+            loss_scale = torch.ones((), dtype=indexer_loss.dtype, device=indexer_loss.device)
+        else:
+            loss_scale = loss_scale.to(device=indexer_loss.device, dtype=indexer_loss.dtype)
+        return grad_output, torch.ones_like(indexer_loss) * loss_scale
+
+    @staticmethod
+    def set_loss_scale(scale: torch.Tensor) -> None:
+        """设置反向时施加在 indexer loss 上的缩放（通常取主 loss 的 detach）。"""
+        IndexerLossAutoScaler.main_loss_backward_scale = scale.detach()

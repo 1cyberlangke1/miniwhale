@@ -61,6 +61,7 @@ class Gate(nn.Module):
         self.scoring_func = text_cfg.scoring_func
         self.norm_topk_prob = text_cfg.norm_topk_prob
         self.route_scale = text_cfg.routed_scaling_factor
+        self.gate_temp = getattr(text_cfg, "gate_temp", 1.0)
 
         self.weight = nn.Parameter(torch.empty(self.n_routed, self.dim))
         self.bias = nn.Parameter(torch.zeros(self.n_routed, dtype=torch.float32))
@@ -99,7 +100,8 @@ class Gate(nn.Module):
         self.tokens_per_expert.zero_()
 
     def forward(self, x: torch.Tensor):
-        scores = F.linear(x.float(), self.weight.float())
+        # 参考实现：scores = linear(x, weight) / gate_temp
+        scores = F.linear(x.float(), self.weight.float()) / self.gate_temp
         if self.scoring_func == "softmax":
             scores = scores.softmax(dim=-1)
         elif self.scoring_func == "sigmoid":
