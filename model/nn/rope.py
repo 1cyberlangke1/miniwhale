@@ -40,18 +40,24 @@ def precompute_freqs_cis(dim: int, seqlen: int, base: float = 10000.0,
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
-    """对 x 的末维施加 RoPE（返回新张量，不原地改）。
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int | None = None,
+                     inverse: bool = False) -> torch.Tensor:
+    """对 x 的末 `rd` 维施加 RoPE（返回新张量，**不原地改**）。
 
-    输入：x [B, L, H, dim]，dim 为偶数；freqs_cis [L, dim//2]；inverse=True 施加共轭（反向旋转）。
-    输出：同形状新张量。
-    预期行为：按复数乘法旋转；freqs 广播成 [1, L, 1, dim//2]。
-              返回新张量（不原地改），避免与自定义 autograd Function 冲突。
+    输入：x [B, L, H, dim] 或 [B, L, dim]，末维为偶数；freqs_cis [L, rd//2]（rd=None 时为 dim//2）；
+          rd 旋转维度（None=全部）；inverse=True 施加共轭（反向旋转）。
+    输出：同形状**新张量**（前 dim-rd 段原样拷贝）。
+    预期行为：把末 rd 维按相邻元素对当复数相乘，与参考实现数值一致。
+              调用方式：`q = apply_rotary_emb(q, freqs, rd)`（须赋回，不能原地改）。
+              注意：**不能原地改**——参考实现推理是 inference-only 的原地版（`y.copy_`），但本仓库
+              要训练，原地改（含切片赋值 `x[..., -rd:] = ...`）会与 autograd 冲突报 inplace 错。
     """
-    dtype = x.dtype
-    xc = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))  # [B,L,...,dim//2]
-    f = freqs_cis.conj() if inverse else freqs_cis  # [L, dim//2]
+    head = None
+    if rd is not None:
+        head, x = x[..., :-rd], x[..., -rd:]
+    xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))  # [B,L,...,dim//2]
+    f = freqs_cis.conj() if inverse else freqs_cis                # [L, dim//2]
     # 序列维是 dim 1：补成 [1, L, *1, dim//2] 与 xc 对齐
     f = f.reshape(1, f.size(0), *([1] * (xc.dim() - 3)), f.size(1))
-    out = torch.view_as_real(xc * f).flatten(-2)
-    return out.to(dtype)
+    out = torch.view_as_real(xc * f).flatten(-2).to(x.dtype)
+    return out if head is None else torch.cat([head, out], dim=-1)

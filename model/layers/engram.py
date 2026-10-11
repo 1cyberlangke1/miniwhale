@@ -42,21 +42,31 @@ class EngramTable(nn.Module):
         self.weight.copy_(torch.randn(self.num_embeddings, self.dim) * 0.02)
 
     def _quantize_rows(self, rows: torch.Tensor):
-        """按参考实现公式把 fp32 行量化成 fp8 + e8m0 scale（每行一个）。
+        """按参考实现公式把 fp32 行量化成 fp8 + e8m0 scale（**每 block_size 个元素一个 scale**）。
 
         输入：rows [..., dim] fp32。
-        输出：(fp8 [..., dim], scale [..., 1] e8m0)。
-        预期行为：amax 按行取、clamp_min(1e-4)；scale = 2^ceil(log2(amax/448))（e8m0）。
+        输出：(fp8 [..., dim], scale [..., dim // block_size] e8m0)。
+        预期行为：amax 按 **block**（dim 方向切 block_size）取、clamp_min(1e-4)；
+                  scale = 2^ceil(log2(amax/448))（e8m0）。按参考实现 ParallelEngramEmbedding：
+                  scale 是 block-wise（dim // fp8_block_size），不是每行一个。
         """
-        amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
-        scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
-        quant = (rows / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-        return quant, scale
+        bs = self.block_size
+        blocks = rows.unflatten(-1, (-1, bs))                           # [..., dim//bs, bs]
+        amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)  # [..., dim//bs, 1]
+        scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))        # e8m0
+        quant = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        return quant.flatten(-2), scale.squeeze(-1)                     # [...,dim], [...,dim//bs]
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         rows = F.embedding(indices, self.weight)                         # [..., dim] fp32
+        if not self.training:
+            # 推理：master 已是最终（反量化后的）权重，直接查表——与参考实现查表反量化等价。
+            # 若此处再量化一次会造成「双重量化」的额外舍入（QAT 只在训练时模拟）。
+            return rows.to(torch.bfloat16)
         quant, scale = self._quantize_rows(rows.detach())
-        deq = quant.float() * scale                                     # 反量化（同参考实现查表）
+        # 反量化（按参考实现查表）：每 block 乘自己的 scale
+        deq = (quant.float().unflatten(-1, (-1, self.block_size))
+               * scale.float().unsqueeze(-1)).flatten(-2)
         # 直通梯度：前向用反量化值，反向把梯度回传 master 权重
         return (deq + (rows - rows.detach())).to(torch.bfloat16)
 

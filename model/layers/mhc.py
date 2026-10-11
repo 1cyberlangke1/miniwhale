@@ -65,6 +65,8 @@ class HyperConnection(nn.Module):
         super().__init__()
         self.hc_mult = text_cfg.hc_mult
         self.hc_eps = text_cfg.hc_eps
+        # 参考实现 hc_mixes 的 rsqrt 用 norm_eps（不是 hc_eps）——两处 eps 不同，须分开存
+        self.norm_eps = text_cfg.rms_norm_eps
         self.sinkhorn_iters = text_cfg.hc_sinkhorn_iters
         dim = text_cfg.hidden_size
         mix_hc = (2 + self.hc_mult) * self.hc_mult
@@ -103,9 +105,8 @@ class HyperConnection(nn.Module):
         hc_scale = getattr(self, f"hc_{which}_scale")
         hc_base = getattr(self, f"hc_{which}_base")
         flat = x.flatten(2).float()
-        # 数值保护：残差流若溢出（bf16 边界）会污染 rsqrt，clamp 输入
-        flat = torch.nan_to_num(flat, nan=0.0, posinf=1e4, neginf=-1e4).clamp(-1e4, 1e4)
-        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.hc_eps)
+        # 参考实现 hc_mixes：rsqrt 用 norm_eps（不是 hc_eps），且无 nan_to_num/clamp——保持一致
+        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = torch.nn.functional.linear(flat, hc_fn.float()) * rsqrt
         return split_mixes(mixes, hc_scale, hc_base, self.hc_mult, self.sinkhorn_iters, self.hc_eps)
 

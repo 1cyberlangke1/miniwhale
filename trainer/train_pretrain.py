@@ -63,7 +63,9 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
         if step % args.log_interval == 0:
             print(f"epoch {epoch} step {step} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
-                  f"{(time.time()-t0)/max(steps,1)*1000:.0f}ms/step")
+                  f"{(time.time()-t0)/max(steps,1)*1000:.0f}ms/step", flush=True)
+        if args.steps and step + 1 >= args.steps:
+            break
     return total_loss / max(steps, 1)
 
 
@@ -72,6 +74,7 @@ def main():
     parser.add_argument("--data_path", type=str, default="dataset/pretrain_t2t_mini.jsonl")
     parser.add_argument("--save_dir", type=str, default="out")
     parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=0, help="最多训练步数（0=跑满 epoch）")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
     parser.add_argument("--accumulation_steps", type=int, default=8)

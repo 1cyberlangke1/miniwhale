@@ -15,9 +15,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from model.layers.compressor import Compressor
-from model.layers.indexer import Indexer, select_candidate_blocks
+from model.layers.indexer import Indexer, IndexerLossAutoScaler, select_candidate_blocks
 from model.nn.norm import RMSNorm
-from model.nn.quant import fake_quant_compressed_kv, fake_quant_fp8
+from model.nn.quant import fake_quant_compressed_kv, fake_quant_fp4, fake_quant_fp8
 from model.nn.rope import apply_rotary_emb
 
 
@@ -175,11 +175,10 @@ class Attention(nn.Module):
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs)
-
+        q = apply_rotary_emb(q, freqs, rd)
         # 滑窗 KV（每层自算）；参考实现对 KV 做 FP8 量化（act_quant, block=32, pow2）
         kv = self.kv_norm(self.wkv(x))
-        apply_rotary_emb(kv[..., -rd:], freqs)
+        kv = apply_rotary_emb(kv, freqs, rd)
         kv = fake_quant_fp8(kv, block_size=32, pow2=True)
         win = self.window_size
         if start_pos == 0:
@@ -207,7 +206,22 @@ class Attention(nn.Module):
             idxs_all = torch.cat([idxs_all, comp_idxs], dim=-1)
 
         o = self._sparse_attn(q, kv_all, idxs_all)
-        apply_rotary_emb(o[..., -rd:], freqs, inverse=True)
+        o = apply_rotary_emb(o, freqs, rd, inverse=True)
+        # indexer 训练：让 indexer 打分对齐主注意力对压缩位置的分布（DSA 做法）。
+        # indexer 的 topk 选择不可微，故用单独的 KL loss 驱动其参数，经 AutoScaler 挂到输出。
+        # 注意：挂在 rope 输出**之后**——custom Function 的输出不能再被后续原地操作改写。
+        if (self.is_index_source and self.indexer is not None
+                and getattr(self.indexer, "_last_score", None) is not None
+                and self.compress_ratio and start_pos == 0):
+            comp_attn = kv_all[:, window_kv.size(1):]          # [B,T,D] 压缩部分
+            score = self.indexer._last_score                   # [B,L,T]
+            if comp_attn.size(1) > 0 and comp_attn.size(1) == score.size(-1):
+                qd = q.detach().float()
+                kd = comp_attn.detach().float()
+                s = torch.einsum("blhd,btd->blht", qd, kd) * self.softmax_scale
+                main_dist = s.mean(dim=2).softmax(dim=-1)      # [B,L,T] 主注意力分布
+                idx_loss = self.indexer.indexer_loss(main_dist, score, idxs_all)
+                o = IndexerLossAutoScaler.apply(o, idx_loss)
 
         o = o.reshape(bsz, seqlen, self.n_groups, -1).to(self.wo_a.weight.dtype)
         wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
@@ -253,6 +267,13 @@ class Attention(nn.Module):
         latent = None
         if self.is_kv_source:
             latent = self.compressor(x, start_pos)
+            # 参考实现：源层把**整个共享 cache** 发布给后续层（非源层按自己的 compress_len 截取）。
+            # 推理走此路（逐位一致）；训练用 latent 保留梯度（见下）。
+            if not self.training:
+                shared.compress_kv = self.compress_kv_cache
+        # 参考实现：shared_attn.index_k 只在「本层 owns_k 且 latent 非 None」时发布
+        # （Indexer.forward 内 if self.owns_k and latent is not None）。组未满的 decode
+        # 非压缩步 latent=None 不发布，此处读到的是上一层 kv_source 遗留的槽——按参考实现。
         # prefill 时每个 query 可见的压缩位置数不同（query t 只能看 (t+1)//ratio 个）
         if start_pos == 0:
             compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
@@ -267,12 +288,15 @@ class Attention(nn.Module):
                 freqs = self.freqs_cis[: seqlen - seqlen % ratio : ratio]
             else:
                 freqs = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
-            apply_rotary_emb(k[..., -rd:], freqs)
-            if start_pos == 0:
-                shared.index_k = k          # 训练：带梯度共享
+            k = apply_rotary_emb(k, freqs, rd)
+            # 参考实现：index k 写缓存前做 FP4 量化（fp4_act_quant, block=32, E8M0 scale）
+            k = fake_quant_fp4(k, block_size=32)
+            if self.training:
+                shared.index_k = k          # 训练：带梯度共享（张量）
             else:
-                with torch.no_grad():
-                    self.index_k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k.detach()
+                # 推理：写缓存并发布**整个缓存**（按参考实现 shared_attn.index_k = self.k_cache）；
+                # 后续 indexer 按 end_pos//ratio 切片，故缓存长度须为 max_seq//ratio。
+                self.index_k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k
                 shared.index_k = self.index_k_cache
 
         idxs = self._compress_topk_idxs(x, qr, latent, start_pos, offset, compress_lens, shared)
@@ -282,15 +306,14 @@ class Attention(nn.Module):
                 freqs = self.freqs_cis[: seqlen - seqlen % ratio : ratio]
             else:
                 freqs = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
-            apply_rotary_emb(latent[..., -rd:], freqs)
+            latent = apply_rotary_emb(latent, freqs, rd)
             # 参考实现对压缩 latent 做 FP4 量化（fp4_act_quant, block=16, E4M3 scale）
             latent = fake_quant_compressed_kv(latent, block_size=16)
-            if start_pos == 0:
+            if self.training:
                 shared.compress_kv = latent   # 训练：带梯度共享给后续层
             else:
-                with torch.no_grad():
-                    self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent.detach()
-                shared.compress_kv = self.compress_kv_cache
+                # 推理：写进 cache（shared.compress_kv 已指向 cache，按参考实现）
+                self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent
         if shared.compress_kv is None:  # 尚无源层发布（如单独调用本层）
             return x.new_zeros(bsz, 0, self.head_dim), idxs
         return shared.compress_kv[:bsz, :compress_len], idxs
@@ -305,15 +328,23 @@ class Attention(nn.Module):
             if shared.topk_idxs is None:  # 尚无源层发布 → 本层无压缩位置可看
                 return torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
             return shared.topk_idxs
-        if shared.index_k is None:
+        # 参考实现：index 源层无条件读共享槽 shared_attn.index_k（Indexer.forward 的
+        # `index_k = shared_attn.index_k[:bsz, : end_pos // ratio]`）。该槽只由「owns_k 且
+        # latent 非 None」的层更新（见 _compress_kv），所以组未满的 decode 非压缩步读到的是
+        # 上一层 kv_source 遗留的缓存——猫猫照抄此语义，不直读自己的缓存。
+        end_pos = start_pos + seqlen
+        index_k = shared.index_k
+        if index_k is None:
             idxs = torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
         else:
             assert self.indexer is not None
             # 参考实现：indexer 的 q 用 attention 层的 freqs_cis（Indexer.freqs_cis = Attention.freqs_cis）
             if self.indexer.freqs_cis is None:
                 self.indexer.freqs_cis = self.freqs_cis
-            idxs = self.indexer(x, qr, shared.index_k, compress_lens, shared.candidates,
-                                offset, start_pos)
+            # 参考实现：index_k 按本层自己的 end_pos//ratio 切片（非源层读的缓存比它自己的压缩位置多）
+            index_k = index_k[:bsz, : end_pos // self.compress_ratio]
+            idxs = self.indexer(x, qr, index_k, compress_lens,
+                                offset, start_pos, shared)
         shared.topk_idxs = idxs
         return idxs
 

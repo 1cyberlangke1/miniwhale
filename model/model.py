@@ -104,19 +104,22 @@ class Model(nn.Module):
             self.image_end = nn.Parameter(torch.randn(tc.hidden_size) * 0.02)
             self.image_newline = nn.Parameter(torch.randn(tc.hidden_size) * 0.02)
 
-    def forward(self, input_ids, start_pos=0, token_mask=None, images=None, token_types=None):
+    def forward(self, input_ids, start_pos=0, token_mask=None, images=None, token_types=None,
+                full_logits=True):
         """主干前向（按参考实现 Transformer.forward 的 VL 接口）。
 
         输入：input_ids [B,L]；start_pos；token_mask [B,L]（False=图像位置，Engram 跳过）；
               images list[list[ImageInput]]（每样本的图像 span，参考实现 prepare_vl_inputs 产物）；
-              token_types [B,L]（TEXT=-1，非负为图像位置类型）。
-        输出：(logits [B,L,V], hidden [B,L,dim])。
+              token_types [B,L]（TEXT=-1，非负为图像位置类型）；
+              full_logits=False 时只算末位置（按参考实现 ParallelHead，推理/对拍用；训练需全序列）。
+        输出：(logits [B,L,V] 或 full_logits=False 时 [B,V], hidden [B,L,dim])。
         预期行为：图像 span 的占位位置被替换为 ViT/Aligner 特征与分隔符嵌入，再走主干。
         """
         tc = self.cfg.text
         b, L = input_ids.shape
-        # 每次前向重置跨层共享槽（避免复用上一次前向的张量）
-        self.shared = SharedAttentionRuntime()
+        # 跨层共享槽**跨前向持久**（按参考实现：shared_attn 是模块级全局，forward 之间不重置）。
+        # 源层每步都会在自己消费者之前写入，故无需重置；decode 的非压缩步正是靠上一前向
+        # 遗留的槽（如 index_k）才能逐位一致——重置会破坏这一语义。
 
         # 图像 span 掩码：参考实现 image_mask = token_types >= 0（TEXT=-1）
         image_mask = None if token_types is None else (token_types >= 0)
@@ -151,7 +154,7 @@ class Model(nn.Module):
 
         h = self.layers[-1].hc.hc_pre(h, pre_mix)  # 折叠成 1 份
         hidden = self.norm(h)
-        logits = self.head(hidden)
+        logits = self.head(hidden, full_logits=full_logits)
         self._last_main_hidden = (
             torch.cat(main_hiddens, dim=-1) if main_hiddens else None)
         return logits, hidden

@@ -87,10 +87,12 @@ class Linear(nn.Module):
 class Head(nn.Module):
     """预测头（LM Head / Markov Head）—— 按参考实现 ParallelHead 的精度语义。
 
-    输入：x [..., in_features]（bf16）。
-    输出：[..., out_features]，**fp32**。
+    输入：x [..., in_features]（bf16）；full_logits=True 时返回整段，否则只算末位置。
+    输出：full_logits 时 [..., seq, out_features]，否则 [..., out_features]，**fp32**。
     预期行为：权重存 **fp32**（参考实现 ParallelHead 显式 dtype=torch.float32，注释说 checkpoint
               里是 bf16、这里存 fp32 以便 logits 直接 fp32 输出）；前向 `F.linear(x.float(), weight)`。
+              **先切片再转 fp32**（按参考实现 `if not full_logits: x = x[:, -1]`）——切片顺序会影响
+              fp32 GEMM 的归约形状，故必须一致才能逐位对齐（训练需要全序列，默认 True）。
     """
 
     def __init__(self, in_features: int, out_features: int, initializer_range: float = 0.02):
@@ -107,5 +109,7 @@ class Head(nn.Module):
         self.weight.copy_(
             torch.randn(self.out_features, self.in_features, dtype=torch.float32) * self.initializer_range)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, full_logits: bool = True) -> torch.Tensor:
+        if not full_logits:
+            x = x[..., -1, :]  # 参考实现：推理只需末位置，先切再转 fp32（归约形状一致）
         return nn.functional.linear(x.float(), self.weight)

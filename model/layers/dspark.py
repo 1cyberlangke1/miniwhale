@@ -201,7 +201,7 @@ class DSparkAttention(Attention):
         # main_x（主干 target hidden）→ 窗口 KV；参考实现对 KV 做 FP8 量化
         main_freqs = self.freqs_cis[start_pos:start_pos + seqlen]
         main_kv = self.kv_norm(self.wkv(main_x))
-        apply_rotary_emb(main_kv[..., -rd:], main_freqs)
+        main_kv = apply_rotary_emb(main_kv, main_freqs, rd)
         main_kv = fake_quant_fp8(main_kv, block_size=32, pow2=True)
 
         self._ensure_cache(bsz)
@@ -222,9 +222,9 @@ class DSparkAttention(Attention):
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
-        apply_rotary_emb(q[..., -rd:], freqs)
+        q = apply_rotary_emb(q, freqs, rd)
         kv = self.kv_norm(self.wkv(x))
-        apply_rotary_emb(kv[..., -rd:], freqs)
+        kv = apply_rotary_emb(kv, freqs, rd)
         kv = fake_quant_fp8(kv, block_size=32, pow2=True)
 
         topk_idxs = get_dspark_topk_idxs(win, bsz, block_size, start_pos).to(x.device)
@@ -233,7 +233,7 @@ class DSparkAttention(Attention):
         kv = torch.cat([self.window_kv_cache[:bsz], kv], dim=1)
 
         o = self._sparse_attn(q, kv, topk_idxs)
-        apply_rotary_emb(o[..., -rd:], freqs, inverse=True)
+        o = apply_rotary_emb(o, freqs, rd, inverse=True)
         o = o.reshape(bsz, block_size, self.n_groups, -1).to(self.wo_a.weight.dtype)
         wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)

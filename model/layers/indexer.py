@@ -71,10 +71,14 @@ class Indexer(nn.Module):
         self.candidate_topk_blocks = text_cfg.candidate_topk_blocks
         self.candidate_block_size = text_cfg.candidate_block_size
 
+        # 只有 kv_source 层（owns_k）才生成 index key，才需要 wk/k_norm；
+        # 其余 index 源层复用源层的 index_k，不建这两层（同样结构：if self.owns_k）。
+        self.owns_k = layer_id in text_cfg.kv_source_layer_ids
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.index_head_dim, bias=False)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False, dtype=torch.bfloat16)
-        self.wk = nn.Linear(text_cfg.head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16)
-        self.k_norm = RMSNorm(self.index_head_dim, text_cfg.rms_norm_eps)
+        if self.owns_k:
+            self.wk = nn.Linear(text_cfg.head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16)
+            self.k_norm = RMSNorm(self.index_head_dim, text_cfg.rms_norm_eps)
         # 参考实现：indexer 的 q 用 attention 层的 freqs_cis 施加 RoPE（Indexer.freqs_cis = Attention.freqs_cis）
         self.freqs_cis = None
 
@@ -86,7 +90,7 @@ class Indexer(nn.Module):
         # 参考实现：对 indexer 的 q 施加 RoPE（末 rope_head_dim 维）
         if self.freqs_cis is not None:
             seqlen = q.size(1)
-            apply_rotary_emb(q[..., -self.rope_head_dim:], self.freqs_cis[start_pos:start_pos + seqlen])
+            q = apply_rotary_emb(q, self.freqs_cis[start_pos:start_pos + seqlen], self.rope_head_dim)
         # 参考实现对 indexer 的 q/k 做 FP4 量化（fp4_act_quant, block=32, E8M0 scale）
         q = fake_quant_fp4(q, block_size=32)
         weights = self.weights_proj(x.to(self.weights_proj.weight.dtype)).to(dtype) \
@@ -124,10 +128,19 @@ class Indexer(nn.Module):
         qr: torch.Tensor,
         index_k: torch.Tensor,
         compress_lens: torch.Tensor | int,
-        candidates: torch.Tensor | None = None,
         offset: int = 0,
         start_pos: int = 0,
+        shared=None,
     ) -> torch.Tensor:
+        """算 topk 索引；candidate_source 层顺带发布一级候选块 mask（按参考实现 Indexer.forward）。
+
+        输入：x [B,L,dim]；qr [B,L,q_lora_rank]；index_k [B,T,index_head_dim]；
+              compress_lens（prefill 逐 query [L,1] / decode 标量）；offset；start_pos；
+              shared（跨层共享槽，读写 candidates）。
+        输出：topk 索引 [B,L,topk]，int32（不可达填 -1，其余加 offset）。
+        预期行为：本层是 candidate_source 时，把候选块 mask 发布到 shared.candidates；
+                  用候选的层则只在源层发布的候选块内取 topk（两级 top-k 的一级）。
+        """
         index_score = self.score(x, qr, index_k, start_pos)  # [B, L, T]
         self._last_score = index_score  # 供 indexer_loss 使用（不参与主 loss 梯度）
         end = index_k.size(1)
@@ -141,8 +154,14 @@ class Indexer(nn.Module):
             reach = pos.view(1, 1, -1) >= compress_lens
         index_score = index_score.masked_fill(reach, -torch.inf)
 
-        if self.uses_candidates and candidates is not None:
-            index_score = index_score.masked_fill(~candidates, -torch.inf)
+        # 一级：candidate_source 层发布候选块；后续层在其内做二级精选
+        if self.is_candidate_source:
+            cand = select_candidate_blocks(
+                index_score, compress_lens, self.candidate_topk_blocks, self.candidate_block_size)
+            if shared is not None:
+                shared.candidates = cand
+        elif self.uses_candidates and shared is not None and shared.candidates is not None:
+            index_score = index_score.masked_fill(~shared.candidates, -torch.inf)
 
         topk = min(self.index_topk, end)
         idxs = index_score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
