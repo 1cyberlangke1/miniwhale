@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -29,17 +30,41 @@ from model.train.optim import make_optimizers
 from model.tokenizer import load_tokenizer
 
 
+def get_lr(step, total_steps, warmup_steps, base_lr, min_lr):
+    """余弦学习率调度（带线性 warmup），照 minimind 惯例。
+
+    输入：step 当前步；total_steps 总步数；warmup_steps 预热步数；base_lr 峰值 lr；min_lr 最低 lr。
+    输出：本步的 lr。
+    预期行为：前 warmup_steps 步从 base_lr/10 线性升到 base_lr；
+              之后按余弦从 base_lr 衰减到 min_lr。
+    """
+    if step < warmup_steps:
+        return base_lr * (0.1 + 0.9 * step / max(warmup_steps, 1))
+    if step >= total_steps:
+        return min_lr
+    ratio = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    cos = 0.5 * (1.0 + math.cos(math.pi * ratio))
+    return min_lr + (base_lr - min_lr) * cos
+
+
 def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0):
     """跑一个 epoch。
 
     输入：epoch；loader；model；三个优化器（Muon/AdamW/Sinkhorn）；args；start_step（续训）。
     输出：本 epoch 的平均 loss。
-    预期行为：bf16 autocast 前向；交叉熵只算非 -100 位置；梯度累积 + 裁剪。
+    预期行为：bf16 autocast 前向；交叉熵只算非 -100 位置；梯度累积 + 裁剪；
+              每步按 warmup+cosine 更新三个优化器的 lr。
     """
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
     for step, batch in enumerate(loader, start=start_step):
+        # 学习率调度：warmup + cosine（Muon 的 lr 由 head-wise 缩放，此处同步 base lr）
+        lr = get_lr(step, args.total_steps, args.warmup_steps,
+                    args.learning_rate, args.min_lr)
+        for opt in (muon, adamw, sinkhorn):
+            for g in opt.param_groups:
+                g["lr"] = lr
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -92,6 +117,12 @@ def main():
     parser.add_argument("--steps", type=int, default=0, help="最多训练步数（0=跑满 epoch）")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--min_lr", type=float, default=5e-5, help="余弦衰减的最低 lr")
+    parser.add_argument("--warmup_steps", type=int, default=2000, help="线性预热步数")
+    parser.add_argument("--total_steps", type=int, default=0,
+                        help="余弦调度的总步数（0=按 --dataset_size//batch_size 自动）")
+    parser.add_argument("--dataset_size", type=int, default=1270238,
+                        help="数据集样本数（流式数据集无法取 len，用于算总步数）")
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--router_bias_rate", type=float, default=1e-3,
@@ -113,6 +144,11 @@ def main():
 
     torch.manual_seed(args.seed)
     torch.set_default_dtype(torch.bfloat16)
+    # 余弦调度总步数：未显式指定则按 数据集样本数 // batch × epochs 估算
+    if not args.total_steps:
+        steps_per_epoch = max(args.dataset_size // args.batch_size, 1)
+        args.total_steps = steps_per_epoch * args.epochs
+    print(f"总步数 {args.total_steps}（warmup {args.warmup_steps}）", flush=True)
 
     cfg = ModelConfig.from_json()
     tokenizer = load_tokenizer()
