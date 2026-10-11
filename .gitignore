@@ -81,3 +81,6 @@ EVAL_LOG.md
 .claude/
 .playwright-mcp/
 .kaggle/
+
+# 测试（依赖本地参考实现对拍，不入库）
+tests/

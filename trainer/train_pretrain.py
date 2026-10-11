@@ -1,0 +1,107 @@
+"""预训练入口。
+
+照 minimind 风格：argparse + train_epoch + __main__。
+用 miniwhale 模型 + Muon/AdamW + 局部 fp32 的 bf16 混合精度。
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from model.config import ModelConfig
+from model.train.data import PretrainDataset
+from model.model import Model
+from model.train.optim import make_optimizers
+from model.tokenizer import load_tokenizer
+
+
+def train_epoch(epoch, loader, model, muon, adamw, args, start_step=0):
+    """跑一个 epoch。
+
+    输入：epoch；loader；model；两个优化器；args；start_step（续训）。
+    输出：本 epoch 的平均 loss。
+    预期行为：bf16 autocast 前向；交叉熵只算非 -100 位置；梯度累积 + 裁剪。
+    """
+    model.train()
+    total_loss, steps = 0.0, 0
+    t0 = time.time()
+    for step, batch in enumerate(loader, start=start_step):
+        ids = batch["input_ids"].to(args.device)
+        labels = batch["labels"].to(args.device)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, _ = model(ids)
+            loss = torch.nn.functional.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.size(-1)),
+                labels[:, 1:].reshape(-1),
+                ignore_index=-100,
+            )
+            loss = loss / args.accumulation_steps
+        # indexer loss 的梯度按主 loss scale 缩放（参考实现 DSA 做法）
+        IndexerLossAutoScaler.set_loss_scale(loss.detach())
+        loss.backward()
+        if (step + 1) % args.accumulation_steps == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            muon.step(); adamw.step()
+            muon.zero_grad(); adamw.zero_grad()
+            # noaux_tc 纠正 bias 按负载均衡规则更新（非梯度）
+            model.update_router_bias(args.router_bias_rate)
+        total_loss += loss.item() * args.accumulation_steps
+        steps += 1
+        if step % args.log_interval == 0:
+            print(f"epoch {epoch} step {step} loss {total_loss / steps:.4f} "
+                  f"lr {adamw.param_groups[0]['lr']:.2e} "
+                  f"{(time.time()-t0)/max(steps,1)*1000:.0f}ms/step")
+    return total_loss / max(steps, 1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="miniwhale 预训练")
+    parser.add_argument("--data_path", type=str, default="dataset/pretrain_t2t_mini.jsonl")
+    parser.add_argument("--save_dir", type=str, default="out")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--accumulation_steps", type=int, default=8)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--max_seq_len", type=int, default=768)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    torch.set_default_dtype(torch.bfloat16)
+
+    cfg = ModelConfig.from_json()
+    tokenizer = load_tokenizer()
+    model = Model(cfg, tokenizer=tokenizer).to(args.device)
+    print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+
+    ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+                        num_workers=args.num_workers, pin_memory=True)
+
+    muon, adamw = make_optimizers(model, lr=args.learning_rate)
+    os.makedirs(args.save_dir, exist_ok=True)
+    for epoch in range(args.epochs):
+        loss = train_epoch(epoch, loader, model, muon, adamw, args)
+        print(f"epoch {epoch} done, avg loss {loss:.4f}")
+        torch.save(model.state_dict(), os.path.join(args.save_dir, f"pretrain_e{epoch}.pth"))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,28 @@
+# miniwhale —— 在 8GB 单卡上从零训练 DeepSeek-V4.1-Flash 架构（Python 3.11）
+#
+# 通用基础设施用现成（torch / 优化器 / 数据），V4.1 特有机制自己写。
+# torch 2.13 已内置 torch.optim.Muon —— 参考实现 V4.1 优化器，无需额外依赖。
+#
+# 安装（torch 需 CUDA 12.6 轮子，单独走 pytorch 源）：
+#   python -m pip install torch --index-url https://download.pytorch.org/whl/cu126
+#   python -m pip install -r requirements.txt
+
+# 核心：训练框架 + 参考实现优化器（Muon / AdamW 均为 torch 内置）
+torch>=2.13.0
+numpy
+
+# 分词器与数据：复用 6400 词表与语料
+transformers
+tokenizers            # Engram 压缩分词器依赖 normalizers（NFKC/NFD/StripAccents/...）
+datasets
+tiktoken
+
+# 工程工具
+einops
+tqdm
+
+# 训练监控
+wandb
+
+# 测试（与参考实现 oracle 对拍）
+pytest
