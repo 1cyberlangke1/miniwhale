@@ -24,6 +24,7 @@ from model.config import ModelConfig
 from model.train.data import PretrainDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
+from model.train.compile import maybe_compile
 from model.train.optim import make_optimizers
 from model.tokenizer import load_tokenizer
 
@@ -64,6 +65,20 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
             print(f"epoch {epoch} step {step} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
                   f"{(time.time()-t0)/max(steps,1)*1000:.0f}ms/step", flush=True)
+        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
+        if args.save_interval and (step + 1) % args.save_interval == 0:
+            os.makedirs(args.save_dir, exist_ok=True)
+            path = os.path.join(args.save_dir, f"pretrain_e{epoch}_s{step+1}.pth")
+            torch.save(model.state_dict(), path)
+            # 只保留最近 N 个（按 mtime），避免塞满磁盘
+            if args.keep_last_n:
+                cks = sorted(
+                    (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
+                     if f.startswith("pretrain_") and f.endswith(".pth")),
+                    key=os.path.getmtime)
+                for old in cks[:-args.keep_last_n]:
+                    os.remove(old)
+            print(f"checkpoint saved at step {step+1}", flush=True)
         if args.steps and step + 1 >= args.steps:
             break
     return total_loss / max(steps, 1)
@@ -84,7 +99,12 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=768)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_interval", type=int, default=10)
-    parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--save_interval", type=int, default=1000,
+                        help="每多少步存一次 checkpoint（0=不存）")
+    parser.add_argument("--keep_last_n", type=int, default=3,
+                        help="只保留最近 N 个 checkpoint（0=全留）")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="从 checkpoint 续训（只恢复模型权重）")
     parser.add_argument("--compile", action="store_true",
                         help="用 torch.compile 加速前向/反向（训练用；推理对拍走 eager 保逐位一致）")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -97,12 +117,12 @@ def main():
     cfg = ModelConfig.from_json()
     tokenizer = load_tokenizer()
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
-    if args.compile:
-        model = torch.compile(model)
+    model = maybe_compile(model, args.compile)
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+    # 数据集是 IterableDataset（流式），自带缓冲打乱，DataLoader 不能再传 shuffle=True
+    loader = DataLoader(ds, batch_size=args.batch_size,
                         num_workers=args.num_workers, pin_memory=True)
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)

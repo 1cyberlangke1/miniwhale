@@ -21,6 +21,7 @@ from model.config import ModelConfig
 from model.train.data import SFTDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
+from model.train.compile import maybe_compile
 from model.train.optim import make_optimizers
 from model.tokenizer import load_tokenizer
 
@@ -79,6 +80,8 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=768)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--compile", action="store_true",
+                        help="用 torch.compile 加速训练（emulate_precision_casts 保数值）")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -91,6 +94,7 @@ def main():
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     if args.ckpt:
         model.load_state_dict(torch.load(args.ckpt, map_location=args.device), strict=False)
+    model = maybe_compile(model, args.compile)
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)

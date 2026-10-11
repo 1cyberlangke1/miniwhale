@@ -134,7 +134,7 @@ def _sample(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
 def _rope_with_freqs(x: torch.Tensor, freqs: torch.Tensor, rd: int, inverse: bool = False) -> torch.Tensor:
     """对 x 末 rd 维施加逐位置 RoPE（支持 [B,L,...] 的 batch 化 freq）。
 
-    输入：x [B,L,H,D]；freqs [B,L,rd//2]（每样本每位置不同）；rd 旋转维度；inverse 施加共轭。
+    输入：x [B,L,H,D]；freqs [B,L,rd//2,2]（末维=(cos,sin)，每样本每位置不同）；rd 旋转维度；inverse 施加共轭。
     输出：同形状新张量。
     预期行为：只旋转末 rd 维（前段 nope 维不动）；freqs 广播到 head 维。参考实现训练各样本 anchor 不同，故需 batch 化。
               纯实数实现（不用复数算子），与 `apply_rotary_emb` 同款，便于 torch.compile。
@@ -143,8 +143,8 @@ def _rope_with_freqs(x: torch.Tensor, freqs: torch.Tensor, rd: int, inverse: boo
     head = x[..., :-rd]
     tail = x[..., -rd:].float()
     # cos/sin 广播到 [B, L, *1, rd//2]，与 tail 的 [..., rd//2, 2] 对齐
-    cos = freqs.real.reshape(freqs.size(0), freqs.size(1), *([1] * (tail.dim() - 3)), freqs.size(-1))
-    sin = freqs.imag.reshape(freqs.size(0), freqs.size(1), *([1] * (tail.dim() - 3)), freqs.size(-1))
+    cos = freqs[..., 0].reshape(freqs.size(0), freqs.size(1), *([1] * (tail.dim() - 3)), freqs.size(-2))
+    sin = freqs[..., 1].reshape(freqs.size(0), freqs.size(1), *([1] * (tail.dim() - 3)), freqs.size(-2))
     if inverse:
         sin = -sin
     x0, x1 = tail[..., 0::2], tail[..., 1::2]

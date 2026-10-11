@@ -12,30 +12,36 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 
-class PretrainDataset(Dataset):
-    """预训练数据集（jsonl，每行 {"text": ...}）。
+class PretrainDataset(IterableDataset):
+    """预训练数据集（jsonl，每行 {"text": ...}）——**流式**读取，不整表载入。
 
-    输入：data_path jsonl 路径；tokenizer；max_length 截断长度。
-    输出：{"input_ids": [L], "labels": [L]}，pad 位置 label=-100。
-    预期行为：tokenize 后加 bos/eos，右侧 padding 到 max_length。
+    输入：data_path jsonl 路径；tokenizer；max_length 截断长度；streaming（默认 True=流式）；
+          shuffle 缓冲区大小（0=顺序）；seed。
+    输出（迭代）：{"input_ids": [L], "labels": [L]}，pad 位置 label=-100。
+    预期行为：streaming=True 时 datasets 流式逐行读（1.2GB / 127 万行也不占内存）；
+              streaming=False 时整表载入内存（map-style 语义，可 __len__）。
+              tokenize 后加 bos/eos，右侧 padding 到 max_length；每个 epoch 打乱。
     """
 
-    def __init__(self, data_path: str | Path, tokenizer, max_length: int = 768):
+    def __init__(self, data_path: str | Path, tokenizer, max_length: int = 768,
+                 streaming: bool = True, shuffle: int = 1000, seed: int = 42):
         from datasets import load_dataset
 
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = load_dataset("json", data_files=str(data_path), split="train")
+        self.path = str(data_path)
+        self.streaming = streaming
+        self.shuffle = shuffle
+        self.seed = seed
+        self.samples = load_dataset("json", data_files=self.path, split="train",
+                                    streaming=streaming)
+        self.num_rows = None if streaming else len(self.samples)
 
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, index):
-        text = str(self.samples[index]["text"])
-        tokens = self.tokenizer(text, add_special_tokens=False,
+    def _encode(self, text: str):
+        tokens = self.tokenizer(str(text), add_special_tokens=False,
                                 max_length=self.max_length - 2, truncation=True).input_ids
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
         pad = self.tokenizer.pad_token_id
@@ -46,29 +52,48 @@ class PretrainDataset(Dataset):
                 labels[i] = -100
         return {"input_ids": torch.tensor(input_ids), "labels": torch.tensor(labels)}
 
+    def __iter__(self):
+        if self.streaming:
+            ds = self.samples.shuffle(buffer_size=self.shuffle, seed=self.seed) \
+                if self.shuffle else self.samples
+            for row in ds:
+                yield self._encode(row["text"])
+        else:
+            order = torch.randperm(len(self.samples)).tolist()
+            for i in order:
+                yield self._encode(self.samples[i]["text"])
 
-class SFTDataset(Dataset):
-    """SFT 数据集（jsonl，多轮对话）。
+    def __len__(self):
+        return self.num_rows
 
-    输入：jsonl 路径；tokenizer；max_length。
-    输出：{"input_ids": [L], "labels": [L]}，只对 assistant 段算 loss。
-    预期行为：apply_chat_template 渲染；非 assistant 段与 pad 位置 label=-100。
+
+class SFTDataset(IterableDataset):
+    """SFT 数据集（jsonl，多轮对话）——**流式**读取，不整表载入。
+
+    输入：jsonl 路径；tokenizer；max_length；streaming（默认 True=流式）；
+          shuffle 缓冲区大小（0=顺序）；seed。
+    输出（迭代）：{"input_ids": [L], "labels": [L]}，只对 assistant 段算 loss。
+    预期行为：streaming=True 时流式逐行读；apply_chat_template 渲染；非 assistant 段与 pad 位置 label=-100。
     """
 
-    def __init__(self, data_path: str | Path, tokenizer, max_length: int = 768):
+    def __init__(self, data_path: str | Path, tokenizer, max_length: int = 768,
+                 streaming: bool = True, shuffle: int = 1000, seed: int = 42):
         from datasets import load_dataset
 
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = load_dataset("json", data_files=str(data_path), split="train")
+        self.path = str(data_path)
+        self.streaming = streaming
+        self.shuffle = shuffle
+        self.seed = seed
+        self.samples = load_dataset("json", data_files=self.path, split="train",
+                                    streaming=streaming)
+        self.num_rows = None if streaming else len(self.samples)
         # assistant 段起止标记（照 minimind：`<|im_start|>assistant\n` ... `<|im_end|>\n`）
         self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant\n",
                                 add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f"{tokenizer.eos_token}\n",
                                 add_special_tokens=False).input_ids
-
-    def __len__(self):
-        return len(self.samples)
 
     def generate_labels(self, input_ids):
         """只在 assistant 段算 loss（照 minimind）。
@@ -94,8 +119,8 @@ class SFTDataset(Dataset):
                 i += 1
         return labels
 
-    def __getitem__(self, index):
-        convs = self.samples[index].get("conversations", [])
+    def _encode(self, row):
+        convs = row.get("conversations", []) or []
         # 只保留模板认识的字段，避免多余键报错
         convs = [{"role": c["role"], "content": c["content"]} for c in convs]
         out = self.tokenizer.apply_chat_template(
@@ -111,6 +136,20 @@ class SFTDataset(Dataset):
         labels = labels + [-100] * (self.max_length - len(labels))
         return {"input_ids": torch.tensor(input_ids[:self.max_length]),
                 "labels": torch.tensor(labels[:self.max_length])}
+
+    def __iter__(self):
+        if self.streaming:
+            ds = self.samples.shuffle(buffer_size=self.shuffle, seed=self.seed) \
+                if self.shuffle else self.samples
+            for row in ds:
+                yield self._encode(row)
+        else:
+            order = torch.randperm(len(self.samples)).tolist()
+            for i in order:
+                yield self._encode(self.samples[i])
+
+    def __len__(self):
+        return self.num_rows
 
 
 class MultimodalDataset(Dataset):

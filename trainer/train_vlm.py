@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from model.config import ModelConfig
 from model.train.data import MultimodalDataset
 from model.model import Model
+from model.train.compile import maybe_compile
 from model.train.optim import make_optimizers
 from model.tokenizer import load_tokenizer
 
@@ -91,6 +92,8 @@ def main():
     ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--log_interval", type=int, default=50)
     ap.add_argument("--save_dir", default="out")
+    ap.add_argument("--compile", action="store_true",
+                    help="用 torch.compile 加速训练（emulate_precision_casts 保数值）")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -100,6 +103,7 @@ def main():
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     if args.ckpt:
         model.load_state_dict(torch.load(args.ckpt, map_location=args.device), strict=False)
+    model = maybe_compile(model, args.compile)
     assert model.vision is not None, "模型未启用视觉塔"
 
     ds = MultimodalDataset(args.data_path, tokenizer, max_length=args.seq_len,

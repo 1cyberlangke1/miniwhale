@@ -19,9 +19,11 @@ def precompute_freqs_cis(dim: int, seqlen: int, base: float = 10000.0,
 
     输入：dim 旋转维度；seqlen 最大长度；base 底数；original_seq_len>0 时启用 YaRN；
           factor 外推倍率；beta_fast/beta_slow 平滑带。
-    输出：[seqlen, dim//2] 的复数张量。
+    输出：[seqlen, dim//2, 2] 的**实数**张量（末维 = (cos, sin)）。
     预期行为：inv_freq = 1 / base^(arange(0,dim,2)/dim)；
               YaRN 时按波长是否落在训练上下文内，分「保留/除以 factor/线性渐变」三段。
+              以实数 (cos, sin) 存储而非复数：inductor 对复数算子无代码生成（退化为 eager），
+              实数存储可让 torch.compile 正常加速；数值与 `polar(1, θ)` 的 real/imag 逐位相同。
     """
     inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     if original_seq_len > 0:
@@ -36,15 +38,15 @@ def precompute_freqs_cis(dim: int, seqlen: int, base: float = 10000.0,
         inv_freq = inv_freq / factor * (1 - smooth) + inv_freq * smooth
 
     t = torch.arange(seqlen).float()
-    freqs = torch.outer(t, inv_freq)
-    return torch.polar(torch.ones_like(freqs), freqs)
+    freqs = torch.outer(t, inv_freq)                       # [seqlen, dim//2] 角度 θ
+    return torch.stack([freqs.cos(), freqs.sin()], dim=-1)  # [seqlen, dim//2, 2] = (cos, sin)
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int | None = None,
                      inverse: bool = False) -> torch.Tensor:
     """对 x 的末 `rd` 维施加 RoPE（返回新张量，**不原地改**）。
 
-    输入：x [B, L, H, dim] 或 [B, L, dim]，末维为偶数；freqs_cis [L, rd//2]（rd=None 时为 dim//2）；
+    输入：x [B, L, H, dim] 或 [B, L, dim]，末维为偶数；freqs_cis [L, rd//2, 2]（rd=None 时为 dim//2，末维=(cos,sin)）；
           rd 旋转维度（None=全部）；inverse=True 施加共轭（反向旋转）。
     输出：同形状**新张量**（前 dim-rd 段原样拷贝）。
     预期行为：把末 rd 维按相邻元素对 (x0,x1) 做二维旋转，**纯实数实现**（不用复数算子）。
@@ -61,8 +63,8 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int | None = 
     dtype = x.dtype
     xf = x.float()                                                # [..., rd]
     # cos/sin 广播到 [1, L, *1, rd//2] 与 xf 的 [..., rd//2, 2] 对齐
-    cos = freqs_cis.real.reshape(1, freqs_cis.size(0), *([1] * (xf.dim() - 3)), freqs_cis.size(1))
-    sin = freqs_cis.imag.reshape(1, freqs_cis.size(0), *([1] * (xf.dim() - 3)), freqs_cis.size(1))
+    cos = freqs_cis[..., 0].reshape(1, freqs_cis.size(0), *([1] * (xf.dim() - 3)), freqs_cis.size(1))
+    sin = freqs_cis[..., 1].reshape(1, freqs_cis.size(0), *([1] * (xf.dim() - 3)), freqs_cis.size(1))
     if inverse:
         sin = -sin                                                # 共轭 = 反向旋转
     x0, x1 = xf[..., 0::2], xf[..., 1::2]                         # 相邻元素对

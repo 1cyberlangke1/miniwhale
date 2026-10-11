@@ -28,6 +28,7 @@ from model.config import ModelConfig
 from model.train.data import PretrainDataset
 from model.train.dspark_loss import compute_dspark_loss
 from model.model import Model
+from model.train.compile import maybe_compile
 from model.tokenizer import load_tokenizer
 
 
@@ -58,6 +59,8 @@ def main():
     ap.add_argument("--lr", type=float, default=6e-4, help="参考实现 lr=6e-4")
     ap.add_argument("--log_interval", type=int, default=50)
     ap.add_argument("--save_dir", default="out")
+    ap.add_argument("--compile", action="store_true",
+                    help="用 torch.compile 加速训练（emulate_precision_casts 保数值）")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -67,6 +70,7 @@ def main():
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     if args.ckpt:
         model.load_state_dict(torch.load(args.ckpt, map_location=args.device), strict=False)
+    model = maybe_compile(model, args.compile)
     trainable = freeze_backbone(model)
     print(f"DSpark 可训练参数 {sum(p.numel() for p in trainable)/1e6:.2f}M")
 

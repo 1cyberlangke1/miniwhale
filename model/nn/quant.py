@@ -36,18 +36,26 @@ def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
 
 
 def _act_quant_fp8(x, block_size, pow2):
-    """参考实现 act_quant：逐块 FP8 量化再反量化（返回 float）。"""
+    """参考实现 act_quant：逐块 FP8 量化再反量化（返回 float）。
+
+    注：除法一律写成 `x * (1/scale)`（显式倒数乘法），因为 torch.compile/inductor 会把
+    `x / scale` 优化成 `x * (1/scale)`——fp32 下两者差 1ulp。显式写乘法可让 eager 与
+    compile **逐位一致**（否则 1ulp 差会在 e2m1 网格舍入处翻转成整格跳变）。
+    """
     xf = x.float()
     n = xf.size(-1)
     blocks = xf.reshape(*xf.shape[:-1], n // block_size, block_size)
     amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
     scale = _fast_round_scale(amax, 1.0 / FP8_MAX) if pow2 else amax / FP8_MAX
-    q = (blocks / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float()
+    q = (blocks * (1.0 / scale)).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float()
     return (q * scale).reshape(xf.shape)
 
 
 def _act_quant_fp4(x, block_size, e4m3_scale):
-    """参考实现 fp4_act_quant：逐块 FP4 量化再反量化（返回 float）。"""
+    """参考实现 fp4_act_quant：逐块 FP4 量化再反量化（返回 float）。
+
+    注：同 `_act_quant_fp8`——除法写显式倒数乘法，保证 eager 与 compile 逐位一致。
+    """
     xf = x.float()
     n = xf.size(-1)
     blocks = xf.reshape(*xf.shape[:-1], n // block_size, block_size)
@@ -58,7 +66,7 @@ def _act_quant_fp4(x, block_size, e4m3_scale):
     else:           # indexer：E8M0（2 的幂）
         amax = amax.clamp_min(FP4_MAX * (2 ** -126))
         scale = _fast_round_scale(amax, 1.0 / FP4_MAX)
-    q = _round_to_e2m1((blocks / scale).clamp(-FP4_MAX, FP4_MAX))
+    q = _round_to_e2m1((blocks * (1.0 / scale)).clamp(-FP4_MAX, FP4_MAX))
     return (q * scale).reshape(xf.shape)
 
 
