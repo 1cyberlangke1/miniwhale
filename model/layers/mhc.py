@@ -112,12 +112,21 @@ class HyperConnection(nn.Module):
         return split_mixes(mixes, hc_scale, hc_base, self.hc_mult, self.sinkhorn_iters, self.hc_eps)
 
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
-        """折叠 hc 副本成一份。x [B,L,hc,dim] × pre_mix [B,L,hc] → [B,L,dim]。"""
-        return (pre_mix.unsqueeze(-1) * x.float()).sum(dim=2).to(x.dtype)
+        """折叠 hc 副本成一份。x [B,L,hc,dim] × pre_mix [B,L,hc] → [B,L,dim]。
+
+        用 einsum 做沿 hc 的加权求和：与参考实现 `(pre_mix.unsqueeze(-1)*x).sum(2)` 数学等价，
+        但不会先造 [B,L,hc,dim] 的中间张量（同一求和顺序，逐位一致）。
+        """
+        return torch.einsum("blh,blhd->bld", pre_mix, x.float()).to(x.dtype)
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor,
                 post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
-        """展开子层输出并混入残差。x [B,L,dim] → [B,L,hc,dim]。"""
-        y = post.unsqueeze(-1) * x.float().unsqueeze(-2) \
-            + torch.sum(comb.unsqueeze(-1) * residual.float().unsqueeze(-2), dim=2)
+        """展开子层输出并混入残差。x [B,L,dim] → [B,L,hc,dim]。
+
+        `comb` 混入项是沿 hc 的收缩（sum over k），用 einsum 直接算：
+        与参考实现 `torch.sum(comb.unsqueeze(-1)*residual.unsqueeze(-2), dim=2)` 数学等价，
+        但避免 [B,L,hc,hc,dim] 的大中间张量与 permute（训练提速的主杠杆）。
+        """
+        mixed = torch.einsum("blij,bljd->blid", comb, residual.float())
+        y = post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed
         return y.type_as(x)

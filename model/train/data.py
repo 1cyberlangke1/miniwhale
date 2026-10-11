@@ -38,7 +38,8 @@ class PretrainDataset(IterableDataset):
         self.seed = seed
         self.samples = load_dataset("json", data_files=self.path, split="train",
                                     streaming=streaming)
-        self.num_rows = None if streaming else len(self.samples)
+        # 行数：datasets 对本地 jsonl 已统计，流式/非流式都在 info.splits 里给，直接用
+        self.num_rows = self.samples.info.splits["train"].num_examples
 
     def _encode(self, text: str):
         tokens = self.tokenizer(str(text), add_special_tokens=False,
@@ -88,7 +89,8 @@ class SFTDataset(IterableDataset):
         self.seed = seed
         self.samples = load_dataset("json", data_files=self.path, split="train",
                                     streaming=streaming)
-        self.num_rows = None if streaming else len(self.samples)
+        # 行数：datasets 对本地 jsonl 已统计，流式/非流式都在 info.splits 里给，直接用
+        self.num_rows = self.samples.info.splits["train"].num_examples
         # assistant 段起止标记（照 minimind：`<|im_start|>assistant\n` ... `<|im_end|>\n`）
         self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant\n",
                                 add_special_tokens=False).input_ids

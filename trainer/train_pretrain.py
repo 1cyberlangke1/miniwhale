@@ -67,6 +67,9 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
                 g["lr"] = lr
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)
+        # CUDA Graph（reduce-overhead）在训练里必须每步标记前向起点，否则上一步输出仍待
+        # 反向、录制的图走不了 fast path（torch 参考实现提示：`cudagraph_mark_step_begin()`）。
+        torch.compiler.cudagraph_mark_step_begin()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits, _ = model(ids)
             loss = torch.nn.functional.cross_entropy(
@@ -120,9 +123,7 @@ def main():
     parser.add_argument("--min_lr", type=float, default=5e-5, help="余弦衰减的最低 lr")
     parser.add_argument("--warmup_steps", type=int, default=2000, help="线性预热步数")
     parser.add_argument("--total_steps", type=int, default=0,
-                        help="余弦调度的总步数（0=按 --dataset_size//batch_size 自动）")
-    parser.add_argument("--dataset_size", type=int, default=1270238,
-                        help="数据集样本数（流式数据集无法取 len，用于算总步数）")
+                        help="余弦调度的总步数（0=按数据集行数 // batch_size 自动）")
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--router_bias_rate", type=float, default=1e-3,
@@ -138,25 +139,27 @@ def main():
                         help="从 checkpoint 续训（只恢复模型权重）")
     parser.add_argument("--compile", action="store_true",
                         help="用 torch.compile 加速前向/反向（训练用；推理对拍走 eager 保逐位一致）")
+    parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
+                        help='torch.compile 模式："default" / "reduce-overhead"（CUDA Graphs）')
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     torch.set_default_dtype(torch.bfloat16)
-    # 余弦调度总步数：未显式指定则按 数据集样本数 // batch × epochs 估算
-    if not args.total_steps:
-        steps_per_epoch = max(args.dataset_size // args.batch_size, 1)
-        args.total_steps = steps_per_epoch * args.epochs
-    print(f"总步数 {args.total_steps}（warmup {args.warmup_steps}）", flush=True)
 
     cfg = ModelConfig.from_json()
     tokenizer = load_tokenizer()
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
-    model = maybe_compile(model, args.compile)
+    model = maybe_compile(model, args.compile, args.compile_mode)
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 余弦调度总步数：未显式指定则按数据集行数 // batch × epochs
+    if not args.total_steps:
+        args.total_steps = max(ds.num_rows // args.batch_size, 1) * args.epochs
+    print(f"数据集 {ds.num_rows} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
+          flush=True)
     # 数据集是 IterableDataset（流式），自带缓冲打乱，DataLoader 不能再传 shuffle=True
     loader = DataLoader(ds, batch_size=args.batch_size,
                         num_workers=args.num_workers, pin_memory=True)

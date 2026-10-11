@@ -160,13 +160,28 @@ class MoE(nn.Module):
         flat = x.reshape(-1, d)
         weights, indices = self.gate(flat, None if image_mask is None else image_mask.flatten())
 
-        # 累加器用 fp32（一致），最后转回输入 dtype
+        # 累加器用 fp32（一致），最后转回输入 dtype。
+        # 参考实现按专家循环 `torch.where(indices == i)`：布尔 mask 的 where 输出长度是动态的，
+        # 每次迭代触发一次 CUDA 同步（num_experts 次/前向），且是 dynamo 图断点、拖慢编译。
+        # 这里改为**预排序**：一次性 argsort 把 (token, k) 对按专家排好，bincount 出每专家
+        # 计数（唯一一次 D2H 同步），再用累积偏移切段。每个 token 仍只进它选中的专家、
+        # 权重不变 —— 与参考实现逐位等价（由对拍测试保证）。
+        k = indices.size(1)
+        flat_e = indices.reshape(-1)
+        flat_tok = torch.arange(flat.size(0), device=flat.device).repeat_interleave(k)
+        order = torch.argsort(flat_e, stable=True)
+        sort_tok = flat_tok[order]
+        sort_w = weights.reshape(-1)[order]
+        counts = torch.bincount(flat_e, minlength=self.n_routed).tolist()
         out = torch.zeros_like(flat, dtype=torch.float32)
+        off = 0
         for i, expert in enumerate(self.experts):
-            idx, top = torch.where(indices == i)
-            if idx.numel() == 0:
+            c = counts[i]
+            if c == 0:
                 continue
-            out[idx] += expert(flat[idx], weights[idx, top, None].float())
+            toks = sort_tok[off:off + c]
+            out[toks] += expert(flat[toks], sort_w[off:off + c, None].float())
+            off += c
 
         for shared in self.shared_experts:
             out = out + shared(flat).float()
