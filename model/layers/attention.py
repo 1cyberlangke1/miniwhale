@@ -76,7 +76,9 @@ class Attention(nn.Module):
         self.rope_head_dim = text_cfg.qk_rope_head_dim
         self.n_groups = text_cfg.o_groups
         self.window_size = text_cfg.sliding_window
-        self.compress_ratio = text_cfg.compress_ratios[layer_id]
+        # 超出主干层号的（DSpark draft 层）默认纯 SWA（ratio=0，同样结构）
+        cr = text_cfg.compress_ratios
+        self.compress_ratio = cr[layer_id] if layer_id < len(cr) else 0
         self.eps = text_cfg.rms_norm_eps
         self.softmax_scale = self.head_dim**-0.5
 

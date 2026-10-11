@@ -90,10 +90,8 @@ class Model(nn.Module):
         self.dspark = None
         if tc.num_nextn_predict_layers > 0 and self.target_layer_ids:
             from model.layers.dspark import DSparkHead
-            self.dspark = DSparkHead(tc)
-            # 把主干 target 层 hidden 拼起来投影成 draft 输入
-            self.main_proj = Linear(tc.hidden_size * len(self.target_layer_ids), tc.hidden_size)
-            self.main_norm = RMSNorm(tc.hidden_size, tc.rms_norm_eps)
+            # 参考实现：draft 共享主干的 embed / head（权重同一份）
+            self.dspark = DSparkHead(tc, self.embed, self.head)
 
     def forward(self, input_ids, start_pos=0, token_mask=None, image_embeds=None):
         """主干前向。
@@ -144,19 +142,17 @@ class Model(nn.Module):
     def forward_spec(self, input_ids: torch.Tensor, start_pos: int = 0):
         """DSpark draft 前向（参考实现 forward_spec 同构）。
 
-        输入：input_ids [B]（上一个 token）；start_pos。
-        输出：(output_ids [B, block+1], logits [B, block, V], confidence [B, block])。
-        预期行为：用主干 target 层 hidden 投影出 draft 输入，跑 draft 头出草稿 + 置信度。
+        输入：input_ids [B]（seed token）；start_pos。
+        输出：start_pos==0 时 None；否则 (output_ids [B, block+1], logits [B, block, V], confidence [B, block])。
+        预期行为：用主干 target 层 hidden 投影出 draft 输入，逐 stage 前向出草稿 + 置信度。
         """
         assert self.dspark is not None, "模型未启用 DSpark"
         main_hidden = getattr(self, "_last_main_hidden", None)
         assert main_hidden is not None, "先调用 forward 以获得主干 target 层 hidden"
-        # 取最后一个位置（预测下一个 token）
-        last_hidden = main_hidden[:, -1]                    # [B, D]
-        main_x = self.main_norm(self.main_proj(last_hidden))  # [B, D]
-        base_logits = self.head(main_x).unsqueeze(1).expand(-1, self.dspark.block_size, -1)
-        hidden = main_x.unsqueeze(1).expand(-1, self.dspark.block_size, -1)
-        return self.dspark(base_logits, hidden, input_ids)
+        # decode（start_pos>0）：主干只对上一步 token 前向，取最后一个位置的 hidden
+        if start_pos > 0:
+            main_hidden = main_hidden[:, -1:]
+        return self.dspark(main_hidden, input_ids, start_pos)
 
     def merge_image_embeds(self, input_ids, h, image_embeds):
         """把视觉特征覆盖到 `<image>` 占位位置。
