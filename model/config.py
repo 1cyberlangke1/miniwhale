@@ -40,6 +40,13 @@ class TextConfig:
     initializer_range: float = 0.02
     max_position_embeddings: int = 32768
     rope_theta: float = 10000.0
+    # HF 标准字段（参考实现 HF config 同款）
+    model_type: str = "miniwhale_text"
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    rope_scaling: object = None
+    tie_word_embeddings: bool = False
+    use_cache: bool = True
     # YaRN 外推：original_seq_len>0 时对压缩层（用 compress_rope_theta）启用
     original_seq_len: int = 0
     rope_factor: float = 40.0
@@ -64,8 +71,8 @@ class TextConfig:
     sliding_window: int = 128
     compress_ratios: tuple = (0, 0, 2, 2, 1, 1, 1, 1)
     compress_rope_theta: float = 160000.0
-    kv_source_layer_ids: tuple = (2, 4)
-    index_source_layer_ids: tuple = (2, 4, 6)
+    kv_source_layer_ids: tuple = (2,)
+    index_source_layer_ids: tuple = (2, 4)
     index_n_heads: int = 8
     index_head_dim: int = 64
     index_topk: int = 32
@@ -108,6 +115,7 @@ class TextConfig:
 class VisionConfig:
     """视觉编码器配置（按参考实现 vision_config 缩水）。"""
 
+    model_type: str = "miniwhale_vision"
     num_hidden_layers: int = 4
     hidden_size: int = 128
     num_attention_heads: int = 4
@@ -116,8 +124,7 @@ class VisionConfig:
     rope_theta: float = 10000.0
     downsample_ratio: int = 3
     max_image_tokens: int = 256
-    # 参考实现 image_processor 的 resize 约束（n_layers==0 关闭视觉）
-    n_layers: int = 4
+    # 参考实现 image_processor 的 resize 约束（num_hidden_layers==0 关闭视觉）
     min_pixels: int = 0
     max_wh_ratio: float | None = None
 

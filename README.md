@@ -5,6 +5,12 @@
 目标不是复现能力，而是**验证机制在不在、有没有用**：
 CSA2、层级稀疏 indexer、Single-Pass mHC、Engram、V4.1 式 MoE、DSpark、ViT。
 
+**与参考实现对齐**：各层公式逐行对按参考实现 发布的 V4.1-Flash 推理实现（低层算子如
+mHC Sinkhorn、MoE 门控、fp8/fp4 量化、RoPE/YaRN、indexer 两级 Top-K 等按其 kernel
+的纯 torch 公式复刻）。同一份权重、同一输入下，本仓库与参考实现 Transformer 的 logits
+最大绝对差 **0.0000**；带 Engram(fp8 表)+DSpark target 重叠时为 5.6e-5（bf16 舍入量级）。
+训练侧优化器按参考实现技术报告 §2.5 / Algorithm 1（Muon + AdamW + Sinkhorn 均衡更新）。
+
 ## 快速开始
 
 ```bash
@@ -36,26 +42,17 @@ python -m venv .venv
 ## 结构
 
 ```
-miniwhale/          源码包
-  config.py         配置（字段名与参考实现 V4.1 config 一致）
+model/              源码包
+  config.py         配置（字段名与参考实现 HF config 一致）
+  config.json       最小档配置
   tokenizer.py      6400 词表（随包分发）
-  linear.py         全局 dtype 机制（set_dtype）
-  norm.py  rope.py
-  engram_hash.py    n-gram 哈希（素数桶）
-  engram.py         条件记忆（门控 + 表）
-  moe.py            V4.1 式 MoE（sqrtsoftplus + noaux_tc）
-  mhc.py            Single-Pass mHC（Sinkhorn）
-  compressor.py     KV 池化
-  indexer.py        两级 Top-K
-  attention.py      MLA + CSA2 + 跨层共享
-  quant.py          QAT 假量化（fp8/fp4）
-  vision.py         ViT + Aligner
-  dspark.py         draft head（Markov + confidence）
-  model.py          组装
-  optim.py          优化器分组（Muon/AdamW/Sinkhorn）
-  data.py           数据加载
-  ablation.py       对照实验开关
-trainer/            训练脚本
+  image_processor.py 图像 span 布局（按参考实现）
+  model.py          组装（含视觉塔 + DSpark）
+  nn/               linear / norm / rope（YaRN）/ quant（fp8/fp4）
+  layers/           attention / compressor / indexer / mhc / moe /
+                    engram / engram_hash / vision / dspark
+  train/            optim / data / dspark_loss / ablation
+trainer/            训练脚本（pretrain / sft / vlm / dspark）
 scripts/            工具脚本
 ```
 

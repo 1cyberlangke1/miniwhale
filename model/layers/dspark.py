@@ -116,6 +116,20 @@ def _dspark_train_mask(anchor_positions, block_keep_mask, seq_len, block_size, d
     return mask.reshape(bsz, q_len, kv_len)
 
 
+def _sample(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """采样（按参考实现 sample）：temperature=0 贪心，否则 Gumbel-max。
+
+    输入：logits [B, V]；temperature。
+    输出：[B] token id。
+    预期行为：Gumbel-max = argmax(softmax(logits/T) / Exp(1))，等价多项采样但无 GPU-CPU 同步。
+    """
+    if temperature == 0:
+        return logits.argmax(dim=-1)
+    logits = logits / max(temperature, 1e-5)
+    probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1)
+
+
 def _rope_with_freqs(x: torch.Tensor, freqs: torch.Tensor, rd: int, inverse: bool = False) -> torch.Tensor:
     """对 x 末 rd 维施加逐位置 RoPE（支持 [B,L,...] 的 batch 化 freq）。
 
@@ -396,8 +410,11 @@ class DSparkHead(nn.Module):
         x = self.embed(draft_ids)
         return x.unsqueeze(2).repeat(1, 1, self.hc_mult, 1), main_x
 
-    def forward_head(self, x, pre_mix, input_ids):
-        """末块出草稿：base logits + markov 偏置 → 自回归采样；confidence head 出接受概率。"""
+    def forward_head(self, x, pre_mix, input_ids, temperature: float = 0.0):
+        """末块出草稿：base logits + markov 偏置 → 自回归采样；confidence head 出接受概率。
+
+        temperature=0 为贪心（argmax）；>0 用 Gumbel-max 采样（参考实现 sample 同款）。
+        """
         last = self.mtp[-1]
         x = last.hc.hc_pre(x, pre_mix)
         base_logits = self.head(last.norm(x))                  # [B, block, V]
@@ -409,17 +426,17 @@ class DSparkHead(nn.Module):
             step_logits = base_logits[:, i] + bias             # 非原地
             logits_list.append(step_logits)
             markov_embeds.append(me)
-            ids_list.append(step_logits.argmax(dim=-1))
+            ids_list.append(_sample(step_logits, temperature))
         logits = torch.stack(logits_list, dim=1)               # [B, block, V]
         output_ids = torch.stack(ids_list, dim=1)              # [B, block+1]
         markov_embed = torch.stack(markov_embeds, dim=1)
         confidence = last.confidence_head(x, markov_embed)
         return output_ids, logits, confidence
 
-    def forward(self, main_hidden, input_ids, start_pos: int = 0):
+    def forward(self, main_hidden, input_ids, start_pos: int = 0, temperature: float = 0.0):
         """draft 前向（prefill 只填缓存，decode 出草稿）。
 
-        输入：main_hidden [B, S, D]；input_ids [B]；start_pos。
+        输入：main_hidden [B, S, D]；input_ids [B]；start_pos；temperature（0=贪心）。
         输出：start_pos==0 时 None；否则 (output_ids, logits, confidence)。
         """
         x, main_x = self.forward_embed(main_hidden, input_ids)
@@ -429,7 +446,7 @@ class DSparkHead(nn.Module):
             x, pre_mix = layer(x, start_pos, pre_mix, main_x)
         if start_pos == 0:
             return None
-        return self.forward_head(x, pre_mix, input_ids)
+        return self.forward_head(x, pre_mix, input_ids, temperature)
 
     def forward_train(self, input_ids, context_hidden, loss_mask, aligned_target_logits=None):
         """训练前向：teacher-forced 并行（按参考实现 Qwen3DSparkModel.forward）。

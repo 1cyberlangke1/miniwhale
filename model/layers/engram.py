@@ -3,14 +3,62 @@
 用哈希 id 取表行，投影成「每个 hc 副本一个 key + 一个共享 value」，
 门控 = 残差流与 key 的归一化点积，加性写回全部 hc 副本。
 表很大但只有命中的行有梯度（稀疏更新）。
+表按参考实现 ParallelEngramEmbedding 以 **FP8 存储 + 块 scale**（查表时反量化）。
 """
 
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from model.nn.norm import RMSNorm  # noqa: F401  (保持与包内其它模块一致的导入习惯)
+
+FP8_BLOCK = 32  # 参考实现 fp8_block_size：一个 scale 管 32 个元素
+
+
+class EngramTable(nn.Module):
+    """n-gram 哈希表：FP8 存储 + 逐行 e8m0 scale（按参考实现 ParallelEngramEmbedding）。
+
+    输入：indices [..., ]（哈希行号）。
+    输出：[..., dim]（bf16，反量化后的行）。
+    预期行为：权重存 **fp8_e4m3fn**、每行一个 **e8m0** scale（与参考实现 checkpoint 一致）；
+              查表取 fp8 行与 scale，按参考实现公式反量化。梯度经 autograd 直通回 master
+              （fp8 参数本身不可反传，故用 fp32 master 存值、前向量化成 fp8 存储语义）。
+    """
+
+    def __init__(self, num_embeddings: int, dim: int, block_size: int = FP8_BLOCK):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.dim = dim
+        self.block_size = block_size
+        # master 权重 fp32（可训练）；前向按参考实现 fp8+scale 反量化
+        self.weight = nn.Parameter(torch.empty(num_embeddings, dim, dtype=torch.float32))
+        self.reset_parameters()
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        """初始化：正态小值。"""
+        self.weight.copy_(torch.randn(self.num_embeddings, self.dim) * 0.02)
+
+    def _quantize_rows(self, rows: torch.Tensor):
+        """按参考实现公式把 fp32 行量化成 fp8 + e8m0 scale（每行一个）。
+
+        输入：rows [..., dim] fp32。
+        输出：(fp8 [..., dim], scale [..., 1] e8m0)。
+        预期行为：amax 按行取、clamp_min(1e-4)；scale = 2^ceil(log2(amax/448))（e8m0）。
+        """
+        amax = rows.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+        scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+        quant = (rows / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        return quant, scale
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        rows = F.embedding(indices, self.weight)                         # [..., dim] fp32
+        quant, scale = self._quantize_rows(rows.detach())
+        deq = quant.float() * scale                                     # 反量化（同参考实现查表）
+        # 直通梯度：前向用反量化值，反向把梯度回传 master 权重
+        return (deq + (rows - rows.detach())).to(torch.bfloat16)
 
 
 class Engram(nn.Module):
@@ -35,7 +83,7 @@ class Engram(nn.Module):
         n_hash_cols = (text_cfg.engram_max_ngram_size - 1) * text_cfg.engram_n_heads
         self.head_dim = text_cfg.engram_head_dim
 
-        self.embed = nn.Embedding(num_embeddings, self.head_dim)
+        self.embed = EngramTable(num_embeddings, self.head_dim)
         self.wkv = nn.Linear(n_hash_cols * self.head_dim, self.dim * (self.hc_mult + 1), bias=False)
         self.q_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim))
         self.k_weight = nn.Parameter(torch.ones(self.hc_mult, self.dim))

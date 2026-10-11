@@ -82,7 +82,8 @@ class Attention(nn.Module):
         self.eps = text_cfg.rms_norm_eps
         self.softmax_scale = self.head_dim**-0.5
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+        # attn sink 初值置零（参考实现 checkpoint 载入前无意义；torch.empty 脏内存会污染 softmax）
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_heads, dtype=torch.float32))
         self.wq_a = nn.Linear(self.dim, self.q_lora_rank, bias=False)
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
         self.wq_b = nn.Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
@@ -230,12 +231,13 @@ class Attention(nn.Module):
         safe = idxs.clamp_min(0)
         k_sel = kf.unsqueeze(1).expand(b, L, T, D).gather(2, safe.unsqueeze(-1).expand(-1, -1, -1, D))
         scores = torch.einsum("blhd,blkd->blhk", qf, k_sel) * self.softmax_scale
-        scores = scores.masked_fill(~valid.unsqueeze(2), -torch.inf)
+        # 参考实现用有限下界 -1e30（非 -inf）：全 -1 行会得到 exp(-inf-(-inf))=NaN，
+        # 有限下界下该行输出全 0，与训练 kernel 约定一致。
+        scores = scores.masked_fill(~valid.unsqueeze(2), -1e30)
         # attn sink：每个 head 一个额外 logit
         sink = self.attn_sink.view(1, 1, H, 1).expand(b, L, H, 1)
         scores = torch.cat([scores, sink], dim=-1)
         probs = scores.softmax(dim=-1)[..., :-1]
-        probs = torch.nan_to_num(probs, nan=0.0)
         out = torch.einsum("blhk,blkd->blhd", probs, k_sel)
         return out.to(q.dtype)
 

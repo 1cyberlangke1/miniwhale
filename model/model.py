@@ -39,17 +39,14 @@ class Block(nn.Module):
         self.hc = HyperConnection(text_cfg)
         self.engram = Engram(text_cfg, layer_id) if layer_id in text_cfg.engram_layer_ids else None
 
-    def forward(self, x, start_pos, pre_mix, *attn_args, engram_hashes=None, token_mask=None,
-                image_mask=None):
+    def forward(self, x, start_pos, pre_mix, *attn_args, image_mask=None):
         """attn_args 透传给 attention（普通块传 shared 运行时；DSpark 块传 main_x）。
 
-        输入：x [B,L,hc,dim]；start_pos；pre_mix；attn_args；engram_hashes；token_mask；
-              image_mask [B,L]（True=图像 span token，MoE 用单独路由 bias）。
+        输入：x [B,L,hc,dim]；start_pos；pre_mix；attn_args；image_mask [B,L]。
         输出：(x, ffn_pre)。
         预期行为：attn 用上一层传的 pre_mix，FFN 用本层 attn 产的 pre_mix（single-pass 错位）。
+                  Engram 注入由 Model 在调本块**之前**完成（按参考实现）。
         """
-        if self.engram is not None and engram_hashes is not None:
-            x = self.engram(x, engram_hashes, token_mask)
         residual = x
         attn_pre, attn_post, attn_comb = self.hc.hc_mixes(x, "attn")
         h = self.hc.hc_pre(x, pre_mix)
@@ -102,9 +99,10 @@ class Model(nn.Module):
             from model.layers.vision import Aligner, ViT
             self.vision = ViT(cfg.vision)
             self.aligner = Aligner(cfg.vision, tc.hidden_size)
-            self.image_start = nn.Parameter(torch.empty(tc.hidden_size))
-            self.image_end = nn.Parameter(torch.empty(tc.hidden_size))
-            self.image_newline = nn.Parameter(torch.empty(tc.hidden_size))
+            # 图像分隔符嵌入：正态小值初始化（参考实现 checkpoint 载入前 torch.empty 会留脏内存）
+            self.image_start = nn.Parameter(torch.randn(tc.hidden_size) * 0.02)
+            self.image_end = nn.Parameter(torch.randn(tc.hidden_size) * 0.02)
+            self.image_newline = nn.Parameter(torch.randn(tc.hidden_size) * 0.02)
 
     def forward(self, input_ids, start_pos=0, token_mask=None, images=None, token_types=None):
         """主干前向（按参考实现 Transformer.forward 的 VL 接口）。
@@ -142,16 +140,14 @@ class Model(nn.Module):
 
         main_hiddens = []  # DSpark 读目标层的注意力输入
         for i, layer in enumerate(self.layers):
-            eh = None
-            if engram_hashes is not None:
-                idx = tuple(tc.engram_layer_ids).index(i) if i in tc.engram_layer_ids else None
-                if idx is not None:
-                    eh = engram_hashes[:, :, idx, :]
+            # 参考实现：Engram 注入在层处理**之前**（且先于 main_hiddens 取值）
+            if layer.engram is not None and engram_hashes is not None:
+                idx = tuple(tc.engram_layer_ids).index(i)
+                h = layer.engram(h, engram_hashes[:, :, idx, :], engram_mask)
             # 参考实现：在层处理**之前**取 hc 副本的均值（MTP 读的是注意力输入）
             if i in self.target_layer_ids:
                 main_hiddens.append(h.mean(dim=2))
-            h, pre_mix = layer(h, start_pos, pre_mix, self.shared,
-                               engram_hashes=eh, token_mask=token_mask, image_mask=image_mask)
+            h, pre_mix = layer(h, start_pos, pre_mix, self.shared, image_mask=image_mask)
 
         h = self.layers[-1].hc.hc_pre(h, pre_mix)  # 折叠成 1 份
         hidden = self.norm(h)
@@ -160,10 +156,10 @@ class Model(nn.Module):
             torch.cat(main_hiddens, dim=-1) if main_hiddens else None)
         return logits, hidden
 
-    def forward_spec(self, input_ids: torch.Tensor, start_pos: int = 0):
+    def forward_spec(self, input_ids: torch.Tensor, start_pos: int = 0, temperature: float = 0.0):
         """DSpark draft 前向（参考实现 forward_spec 同构）。
 
-        输入：input_ids [B]（seed token）；start_pos。
+        输入：input_ids [B]（seed token）；start_pos；temperature（0=贪心）。
         输出：start_pos==0 时 None；否则 (output_ids [B, block+1], logits [B, block, V], confidence [B, block])。
         预期行为：用主干 target 层 hidden 投影出 draft 输入，逐 stage 前向出草稿 + 置信度。
         """
@@ -173,7 +169,7 @@ class Model(nn.Module):
         # decode（start_pos>0）：主干只对上一步 token 前向，取最后一个位置的 hidden
         if start_pos > 0:
             main_hidden = main_hidden[:, -1:]
-        return self.dspark(main_hidden, input_ids, start_pos)
+        return self.dspark(main_hidden, input_ids, start_pos, temperature)
 
     def encode_image(self, patches, n_vit_h: int, n_vit_w: int):
         """ViT + Aligner：把 patch 网格编码成 Aligner 特征行。
