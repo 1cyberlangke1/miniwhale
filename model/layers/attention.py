@@ -37,21 +37,23 @@ class SharedAttentionRuntime:
     candidates: torch.Tensor | None = None
 
 
-def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int) -> torch.Tensor:
+def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int,
+                         device=None) -> torch.Tensor:
     """每个 query 可见的滑窗缓存槽位；-1 表示空槽。
 
-    输入：window_size；bsz；seqlen；start_pos。
+    输入：window_size；bsz；seqlen；start_pos；device（**直接在目标设备建张量，避免 CPU→GPU 同步**）。
     输出：[bsz, seqlen, min(seqlen,window_size)]（prefill）或 [bsz,1,window_size]（decode），int32。
     预期行为：缓存是 window_size 个槽的环形缓冲。prefill 每 query 一行、各自因果窗口；
               decode 单 query 看整个环，最旧在前。
     """
     if start_pos == 0:
-        end = torch.arange(seqlen).unsqueeze(1)
-        idxs = (end - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
+        end = torch.arange(seqlen, device=device).unsqueeze(1)
+        idxs = (end - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size), device=device)
         idxs = torch.where(idxs > end, -1, idxs)
     else:
         oldest = start_pos % window_size + 1
-        idxs = torch.cat([torch.arange(oldest, window_size), torch.arange(oldest)])
+        idxs = torch.cat([torch.arange(oldest, window_size, device=device),
+                          torch.arange(oldest, device=device)])
         idxs = torch.where(idxs > start_pos, -1, idxs)
     return idxs.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
 
@@ -195,7 +197,7 @@ class Attention(nn.Module):
         else:
             self.window_kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             window_kv = self.window_kv_cache[:bsz]
-        win_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos).to(x.device)
+        win_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos, x.device)
 
         kv_all = window_kv
         idxs_all = win_idxs

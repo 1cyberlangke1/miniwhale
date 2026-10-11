@@ -21,6 +21,7 @@ def sinkhorn_normalize(x: torch.Tensor, repeat: int = 20, eps: float = 1e-6) -> 
     输入：x [..., n, n]，任意浮点。
     输出：同形状，行列交替归一后的双随机矩阵。
     预期行为：先 softmax(-1)+eps，再 (列归一, 行归一) 交替 repeat 次，每步分母 +eps。
+              注：迭代**本质串行**（每步依赖上一步），无法向量化；算子数靠 torch.compile 融合。
     """
     x = x.softmax(-1) + eps
     x = x / (x.sum(-2, keepdim=True) + eps)

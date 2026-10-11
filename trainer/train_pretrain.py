@@ -85,6 +85,8 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--compile", action="store_true",
+                        help="用 torch.compile 加速前向/反向（训练用；推理对拍走 eager 保逐位一致）")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -95,6 +97,8 @@ def main():
     cfg = ModelConfig.from_json()
     tokenizer = load_tokenizer()
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
+    if args.compile:
+        model = torch.compile(model)
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)

@@ -27,17 +27,18 @@ from model.nn.rope import apply_rotary_emb
 
 
 @lru_cache(1)
-def get_dspark_topk_idxs(window_size: int, bsz: int, block_size: int, start_pos: int):
+def get_dspark_topk_idxs(window_size: int, bsz: int, block_size: int, start_pos: int,
+                         device=None):
     """draft block 每个 query 可见的 KV 槽位（按参考实现 get_dspark_topk_idxs）。
 
-    输入：window_size；bsz；block_size；start_pos（>0）。
+    输入：window_size；bsz；block_size；start_pos（>0）；device（**直接在目标设备建张量**）。
     输出：[bsz, block_size, min(win, start_pos+1)+block_size]，int32。
     预期行为：每个 draft query 看 [窗口内历史槽 … | 本块 block_size 个槽]。
     """
     assert start_pos > 0
     matrix = torch.cat([
-        torch.arange(min(window_size, start_pos + 1)),
-        window_size + torch.arange(block_size),
+        torch.arange(min(window_size, start_pos + 1), device=device),
+        window_size + torch.arange(block_size, device=device),
     ])
     return matrix.int().view(1, 1, -1).expand(bsz, block_size, -1).contiguous()
 
@@ -136,14 +137,20 @@ def _rope_with_freqs(x: torch.Tensor, freqs: torch.Tensor, rd: int, inverse: boo
     输入：x [B,L,H,D]；freqs [B,L,rd//2]（每样本每位置不同）；rd 旋转维度；inverse 施加共轭。
     输出：同形状新张量。
     预期行为：只旋转末 rd 维（前段 nope 维不动）；freqs 广播到 head 维。参考实现训练各样本 anchor 不同，故需 batch 化。
+              纯实数实现（不用复数算子），与 `apply_rotary_emb` 同款，便于 torch.compile。
     """
     dtype = x.dtype
     head = x[..., :-rd]
-    tail = x[..., -rd:]
-    xc = torch.view_as_complex(tail.float().reshape(*tail.shape[:-1], -1, 2))
-    f = freqs.conj() if inverse else freqs
-    f = f.reshape(f.size(0), f.size(1), *([1] * (xc.dim() - 3)), f.size(-1))
-    tail = torch.view_as_real(xc * f).flatten(-2).to(dtype)
+    tail = x[..., -rd:].float()
+    # cos/sin 广播到 [B, L, *1, rd//2]，与 tail 的 [..., rd//2, 2] 对齐
+    cos = freqs.real.reshape(freqs.size(0), freqs.size(1), *([1] * (tail.dim() - 3)), freqs.size(-1))
+    sin = freqs.imag.reshape(freqs.size(0), freqs.size(1), *([1] * (tail.dim() - 3)), freqs.size(-1))
+    if inverse:
+        sin = -sin
+    x0, x1 = tail[..., 0::2], tail[..., 1::2]
+    o0 = x0 * cos - x1 * sin
+    o1 = x0 * sin + x1 * cos
+    tail = torch.stack([o0, o1], dim=-1).flatten(-2).to(dtype)
     return torch.cat([head, tail], dim=-1)
 
 
@@ -227,7 +234,7 @@ class DSparkAttention(Attention):
         kv = apply_rotary_emb(kv, freqs, rd)
         kv = fake_quant_fp8(kv, block_size=32, pow2=True)
 
-        topk_idxs = get_dspark_topk_idxs(win, bsz, block_size, start_pos).to(x.device)
+        topk_idxs = get_dspark_topk_idxs(win, bsz, block_size, start_pos, x.device)
         with torch.no_grad():
             self.window_kv_cache[:bsz, start_pos % win] = main_kv.squeeze(1).detach()
         kv = torch.cat([self.window_kv_cache[:bsz], kv], dim=1)

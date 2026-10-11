@@ -47,7 +47,10 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int | None = 
     输入：x [B, L, H, dim] 或 [B, L, dim]，末维为偶数；freqs_cis [L, rd//2]（rd=None 时为 dim//2）；
           rd 旋转维度（None=全部）；inverse=True 施加共轭（反向旋转）。
     输出：同形状**新张量**（前 dim-rd 段原样拷贝）。
-    预期行为：把末 rd 维按相邻元素对当复数相乘，与参考实现数值一致。
+    预期行为：把末 rd 维按相邻元素对 (x0,x1) 做二维旋转，**纯实数实现**（不用复数算子）。
+              数学与复数版 `view_as_complex → ×e^{iθ} → view_as_real` 完全等价；
+              在 fp32 下计算与复数版**逐位相等**。用实数实现的原因：torch.compile/inductor
+              对复数算子支持差（多数退化为 fallback），且会引入额外的 bf16 归约偏差。
               调用方式：`q = apply_rotary_emb(q, freqs, rd)`（须赋回，不能原地改）。
               注意：**不能原地改**——参考实现推理是 inference-only 的原地版（`y.copy_`），但本仓库
               要训练，原地改（含切片赋值 `x[..., -rd:] = ...`）会与 autograd 冲突报 inplace 错。
@@ -55,9 +58,15 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, rd: int | None = 
     head = None
     if rd is not None:
         head, x = x[..., :-rd], x[..., -rd:]
-    xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))  # [B,L,...,dim//2]
-    f = freqs_cis.conj() if inverse else freqs_cis                # [L, dim//2]
-    # 序列维是 dim 1：补成 [1, L, *1, dim//2] 与 xc 对齐
-    f = f.reshape(1, f.size(0), *([1] * (xc.dim() - 3)), f.size(1))
-    out = torch.view_as_real(xc * f).flatten(-2).to(x.dtype)
+    dtype = x.dtype
+    xf = x.float()                                                # [..., rd]
+    # cos/sin 广播到 [1, L, *1, rd//2] 与 xf 的 [..., rd//2, 2] 对齐
+    cos = freqs_cis.real.reshape(1, freqs_cis.size(0), *([1] * (xf.dim() - 3)), freqs_cis.size(1))
+    sin = freqs_cis.imag.reshape(1, freqs_cis.size(0), *([1] * (xf.dim() - 3)), freqs_cis.size(1))
+    if inverse:
+        sin = -sin                                                # 共轭 = 反向旋转
+    x0, x1 = xf[..., 0::2], xf[..., 1::2]                         # 相邻元素对
+    o0 = x0 * cos - x1 * sin
+    o1 = x0 * sin + x1 * cos
+    out = torch.stack([o0, o1], dim=-1).flatten(-2).to(dtype)
     return out if head is None else torch.cat([head, out], dim=-1)
