@@ -86,6 +86,12 @@ class TextConfig:
     dspark_markov_rank: int = 64
     dspark_n_routed_experts: int = 4
     dspark_num_experts_per_tok: int = 2
+    # 参考实现训练超参（DeepSpec config/dspark/dspark_qwen3_4b.py）
+    dspark_num_anchors: int = 512
+    dspark_loss_decay_gamma: float = 4.0
+    dspark_ce_loss_alpha: float = 0.1
+    dspark_l1_loss_alpha: float = 0.9
+    dspark_confidence_head_alpha: float = 1.0
 
 
 @dataclass

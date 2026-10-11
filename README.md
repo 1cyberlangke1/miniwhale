@@ -17,9 +17,6 @@ python -m venv .venv
 #   pretrain_t2t_mini.jsonl / sft_t2t_mini.jsonl（文本）
 #   sft_i2t.parquet（多模态，含 pretrain 子集）
 
-# 测试（需指向参考实现实现目录）
-MINIWHALE_ORACLE=<path>/tmp .venv/Scripts/python -m pytest tests/
-
 # 预训练
 .venv/Scripts/python trainer/train_pretrain.py --data_path dataset/pretrain_t2t_mini.jsonl
 
@@ -58,7 +55,6 @@ miniwhale/          源码包
   optim.py          优化器分组（Muon/AdamW/Sinkhorn）
   data.py           数据加载
   ablation.py       对照实验开关
-tests/              每模块 vs 参考实现 oracle 对拍
 trainer/            训练脚本
 scripts/            工具脚本
 ```

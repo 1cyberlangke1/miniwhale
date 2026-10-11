@@ -5,7 +5,11 @@
   - 冻结 backbone，只训 DSpark（本脚本）
   - post-training 同训但梯度不回传 backbone
 
-loss：draft 每个位置的交叉熵（草稿 token vs 真实下一 token）+ 置信度 BCE。
+训练前向与 loss 逐行对按参考实现 DeepSpec（deepseek-ai/DeepSpec）：
+  - 前向：teacher-forced 并行（Qwen3DSparkModel.forward）——采 anchor、噪声嵌入、并行出草稿，
+    markov 偏置用**真实前驱 token**（非自回归采样）。
+  - loss：compute_dspark_loss —— CE(0.1) + L1 蒸馏(0.9) + confidence BCE(1.0)，位置衰减 exp(-i/4)。
+    confidence 目标是接受率 accept_rate，不是命中率。
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
 from model.train.data import PretrainDataset
+from model.train.dspark_loss import compute_dspark_loss
 from model.model import Model
 from model.tokenizer import load_tokenizer
 
@@ -43,31 +48,14 @@ def freeze_backbone(model: Model):
     return trainable
 
 
-def dspark_loss(out_ids, logits, confidence, target, block_size, ignore_index=-100):
-    """DSpark 训练 loss：draft 交叉熵 + 置信度 BCE。
-
-    输入：out_ids [B, block+1]；logits [B, block, V]；confidence [B, block]；
-          target [B, block]（草稿各位置的真实下一 token）。
-    输出：标量 loss。
-    预期行为：draft 位置 i 预测 target[:, i]；置信度对命中与否做 BCE。
-    """
-    ce = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, logits.size(-1)), target.reshape(-1), ignore_index=ignore_index)
-    with torch.no_grad():
-        hit = (out_ids[:, 1:1 + block_size] == target).float()
-    bce = torch.nn.functional.binary_cross_entropy_with_logits(
-        confidence.reshape(-1), hit.reshape(-1))
-    return ce + bce
-
-
 def main():
     ap = argparse.ArgumentParser(description="miniwhale DSpark 训练")
     ap.add_argument("--data_path", default="dataset/pretrain_t2t_mini.jsonl")
     ap.add_argument("--ckpt", default=None, help="已训练的 backbone 权重（可选）")
     ap.add_argument("--steps", type=int, default=1000)
     ap.add_argument("--seq_len", type=int, default=256)
-    ap.add_argument("--batch", type=int, default=4)
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--batch", type=int, default=1)
+    ap.add_argument("--lr", type=float, default=6e-4, help="参考实现 lr=6e-4")
     ap.add_argument("--log_interval", type=int, default=50)
     ap.add_argument("--save_dir", default="out")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
@@ -87,6 +75,7 @@ def main():
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95))
     model.train()
 
+    tc = cfg.text
     it = iter(loader)
     for step in range(args.steps):
         try:
@@ -95,19 +84,20 @@ def main():
             it = iter(loader); batch = next(it)
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)
+        loss_mask = (labels != -100).float()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            # 参考实现流程：先整段 prefill（填主干与 draft 的窗口缓存），再在末位置 decode 出草稿
-            L = ids.size(1)
-            model(ids)                                        # 主干前向填 _last_main_hidden
-            model.forward_spec(ids[:, -1], start_pos=0)       # draft prefill：填窗口缓存
-            out_ids, logits, conf = model.forward_spec(ids[:, -1], start_pos=L)
-            # 草稿位置 i 的真实下一 token 是 labels[:, L+i]（末尾不足则忽略）
-            bs = cfg.text.dspark_block_size
-            tgt = labels[:, L - 1:L - 1 + bs]
-            if tgt.size(1) < bs:                              # 末尾补 -100（忽略）
-                pad = tgt.new_full((tgt.size(0), bs - tgt.size(1)), -100)
-                tgt = torch.cat([tgt, pad], dim=1)
-            loss = dspark_loss(out_ids, logits, conf, tgt, bs)
+            # 主干前向：拿 target 层 hidden 与全序列 logits（后者供 L1 蒸馏 / accept_rate）
+            logits, _ = model(ids)
+            context_hidden = model._last_main_hidden
+            out = model.dspark.forward_train(ids, context_hidden, loss_mask,
+                                             aligned_target_logits=logits)
+            loss = compute_dspark_loss(
+                out,
+                loss_decay_gamma=tc.dspark_loss_decay_gamma,
+                ce_loss_alpha=tc.dspark_ce_loss_alpha,
+                l1_loss_alpha=tc.dspark_l1_loss_alpha,
+                confidence_head_alpha=tc.dspark_confidence_head_alpha,
+            )
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
