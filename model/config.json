@@ -9,7 +9,7 @@
   "bos_token_id": 1,
   "eos_token_id": 2,
   "pad_token_id": 0,
-  "image_token_id": 6200,
+  "image_token_id": 12,
   "text_config": {
     "model_type": "miniwhale_text",
     "vocab_size": 6400,
@@ -117,7 +117,7 @@
     "rope_theta": 10000,
     "downsample_ratio": 3,
     "max_image_tokens": 256,
-    "min_pixels": 295936,
+    "min_pixels": 0,
     "max_wh_ratio": null
   },
   "_engram_notes": {

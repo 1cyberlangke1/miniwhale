@@ -95,30 +95,45 @@ class Model(nn.Module):
             # 参考实现：draft 共享主干的 embed / head（权重同一份）
             self.dspark = DSparkHead(tc, self.embed, self.head)
 
-    def forward(self, input_ids, start_pos=0, token_mask=None, image_embeds=None):
-        """主干前向。
+        # 视觉塔 + Aligner + 图像 span 的分隔符嵌入（参考实现 Transformer 同款）
+        self.vision = None
+        self.aligner = None
+        if getattr(tc, "vision_enabled", False):
+            from model.layers.vision import Aligner, ViT
+            self.vision = ViT(cfg.vision)
+            self.aligner = Aligner(cfg.vision, tc.hidden_size)
+            self.image_start = nn.Parameter(torch.empty(tc.hidden_size))
+            self.image_end = nn.Parameter(torch.empty(tc.hidden_size))
+            self.image_newline = nn.Parameter(torch.empty(tc.hidden_size))
+
+    def forward(self, input_ids, start_pos=0, token_mask=None, images=None, token_types=None):
+        """主干前向（按参考实现 Transformer.forward 的 VL 接口）。
 
         输入：input_ids [B,L]；start_pos；token_mask [B,L]（False=图像位置，Engram 跳过）；
-              image_embeds list[Tensor]（每个 [n_tokens, dim]），非 None 时覆盖图像占位位置的 embedding。
+              images list[list[ImageInput]]（每样本的图像 span，参考实现 prepare_vl_inputs 产物）；
+              token_types [B,L]（TEXT=-1，非负为图像位置类型）。
         输出：(logits [B,L,V], hidden [B,L,dim])。
-        预期行为：先把 `<image>` 位置的 embedding 替换为视觉特征，再走主干。
+        预期行为：图像 span 的占位位置被替换为 ViT/Aligner 特征与分隔符嵌入，再走主干。
         """
         tc = self.cfg.text
         b, L = input_ids.shape
         # 每次前向重置跨层共享槽（避免复用上一次前向的张量）
         self.shared = SharedAttentionRuntime()
 
+        # 图像 span 掩码：参考实现 image_mask = token_types >= 0（TEXT=-1）
+        image_mask = None if token_types is None else (token_types >= 0)
+        # Engram 跳过图像 token：参考实现 engram_mask = ~image_mask
+        engram_mask = token_mask
+        if engram_mask is None and image_mask is not None:
+            engram_mask = ~image_mask
+
         engram_hashes = None
         if self.engram_hash is not None:
-            engram_hashes = self.engram_hash(input_ids, token_mask)  # [B,L,n_layers,n_hash_cols]
-
-        # 图像 span 掩码：MoE 对图像 token 用单独路由 bias（参考实现 noaux_tc_for_vl）
-        img_id = getattr(tc, "image_token_id", None)
-        image_mask = (input_ids == img_id) if (img_id is not None and image_embeds is not None) else None
+            engram_hashes = self.engram_hash(input_ids, engram_mask)  # [B,L,n_layers,n_hash_cols]
 
         h = self.embed(input_ids)                       # [B,L,dim]
-        if image_embeds is not None:
-            h = self.merge_image_embeds(input_ids, h, image_embeds)
+        if images is not None:
+            h = self.merge_image_embeddings(images, h)
         h = h.unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()  # [B,L,hc,dim]
 
         # 初始 one-hot pre_mix（第 0 份复制为 1）
@@ -160,26 +175,33 @@ class Model(nn.Module):
             main_hidden = main_hidden[:, -1:]
         return self.dspark(main_hidden, input_ids, start_pos)
 
-    def merge_image_embeds(self, input_ids, h, image_embeds):
-        """把视觉特征覆盖到 `<image>` 占位位置。
+    def encode_image(self, patches, n_vit_h: int, n_vit_w: int):
+        """ViT + Aligner：把 patch 网格编码成 Aligner 特征行。
 
-        输入：input_ids [B,L]；h [B,L,dim]；image_embeds list[Tensor]（每个 [n_tokens,dim]）。
-        输出：新的 h [B,L,dim]。
-        预期行为：找到每个样本的 image_token_id 连续段，把对应的视觉 token 按顺序写入。
+        输入：patches [n_vit_h*n_vit_w, 3, p, p]；n_vit_h；n_vit_w。
+        输出：[n_llm_h*n_llm_w, dim]。
         """
-        tc = self.cfg.text
-        img_id = getattr(tc, "image_token_id", None)
-        if img_id is None:
-            return h
+        return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
+
+    def merge_image_embeddings(self, images, h: torch.Tensor):
+        """把每张图的 token span 覆盖成 ViT/Aligner 特征（按参考实现 merge_image_embeddings）。
+
+        输入：images list[list[ImageInput]]（每样本的图像 span）；h [B,L,dim]。
+        输出：新的 h [B,L,dim]。
+        预期行为：IMAGE 槽按行主序填入 aligner 行；start/end/newline 填学习嵌入。
+        """
+        from model.image_processor import IMAGE, IMAGE_END, IMAGE_NEW_LINE, IMAGE_START
+
         h = h.clone()
-        for i, emb in enumerate(image_embeds):
-            if emb is None:
-                continue
-            pos = (input_ids[i] == img_id).nonzero(as_tuple=True)[0]
-            if pos.numel() == 0:
-                continue
-            n = min(pos.numel(), emb.size(0))
-            h[i, pos[:n]] = emb[:n].to(h.dtype)
+        for i, sample in enumerate(images):
+            for img in sample or ():
+                types = img.types.to(h.device)
+                span = h[i, img.start:img.start + types.numel()]
+                span[types == IMAGE_START] = self.image_start.to(h.dtype)
+                span[types == IMAGE_END] = self.image_end.to(h.dtype)
+                span[types == IMAGE_NEW_LINE] = self.image_newline.to(h.dtype)
+                embeds = self.encode_image(img.patches.to(h.device), img.n_vit_h, img.n_vit_w)
+                span[types == IMAGE] = embeds.to(h.dtype)
         return h
 
     @torch.no_grad()

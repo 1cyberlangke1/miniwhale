@@ -57,6 +57,8 @@ class TextConfig:
     gate_temp: float = 1.0
     # 多模态：图像 span token 用单独的路由 bias（参考实现 noaux_tc_for_vl）
     vision_enabled: bool = True
+    # 图像占位 token 的 id（参考实现 image_token_id）；minimind 词表里 <|image_pad|> = 12
+    image_token_id: int = 12
 
     # CSA2 / 跨层共享
     sliding_window: int = 128
@@ -114,6 +116,10 @@ class VisionConfig:
     rope_theta: float = 10000.0
     downsample_ratio: int = 3
     max_image_tokens: int = 256
+    # 参考实现 image_processor 的 resize 约束（n_layers==0 关闭视觉）
+    n_layers: int = 4
+    min_pixels: int = 0
+    max_wh_ratio: float | None = None
 
 
 @dataclass
@@ -130,15 +136,25 @@ class ModelConfig:
 
     @classmethod
     def from_json(cls, path: Path | str = _CONFIG_PATH) -> "ModelConfig":
-        """从 JSON 加载，list → tuple。"""
+        """从 JSON 加载，list → tuple。
+
+        顶层字段 image_token_id（参考实现放在顶层但属 text 语义）注入 text_config；
+        vision_n_layers 决定 vision_enabled（参考实现 vision_enabled = vision_n_layers > 0）。
+        """
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        text_raw = dict(raw.get("text_config", {}))
+        if "image_token_id" in raw:
+            text_raw["image_token_id"] = raw["image_token_id"]
+        vision_raw = raw.get("vision_config", {})
+        # 参考实现：vision_enabled 由视觉层数决定
+        text_raw["vision_enabled"] = vision_raw.get("num_hidden_layers", 0) > 0
         text = TextConfig(**{
             k: (tuple(v) if isinstance(v, list) else v)
-            for k, v in raw.get("text_config", {}).items()
+            for k, v in text_raw.items()
             if k in TextConfig.__dataclass_fields__
         })
         vision = VisionConfig(**{
-            k: v for k, v in raw.get("vision_config", {}).items()
+            k: v for k, v in vision_raw.items()
             if k in VisionConfig.__dataclass_fields__
         })
         return cls(text=text, vision=vision)

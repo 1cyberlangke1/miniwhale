@@ -116,23 +116,23 @@ class SFTDataset(Dataset):
 class MultimodalDataset(Dataset):
     """多模态 SFT 数据集（parquet：conversations + image_bytes）。
 
-    输入：parquet 路径；tokenizer；max_length；占位符与 image pad token；图像尺寸。
-    输出：{"input_ids": [L], "labels": [L], "image": PIL.Image | None}。
-    预期行为：`<image>` 占位符展开成 image_token_len 个 image pad token；图像缩放到 image_size。
+    输入：parquet 路径；tokenizer；max_length；vision 配置（patch/下采样/尺寸约束）。
+    输出：{"input_ids": [L], "labels": [L], "token_types": [L], "images": list[ImageInput]}。
+    预期行为：按参考实现 image_processor —— `<image>` 占位符展开成
+              [IMAGE_START] + ([IMAGE]*w + [IMAGE_NEW_LINE])*h + [IMAGE_END]，全用同一
+              image_token_id，靠 token_types 区分；图像切成 ViT patch。
     """
 
     def __init__(self, data_path: str | Path, tokenizer, max_length: int = 768,
-                 image_placeholder: str = "<image>", image_token: str = "<|image_pad|>",
-                 image_token_len: int = 36, image_size: int = 256,
-                 row_group_size: int = 64):
+                 image_placeholder: str = "<image>", image_token_id: int = 12,
+                 vision_cfg=None, row_group_size: int = 64):
         import pyarrow.parquet as pq
 
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.image_placeholder = image_placeholder
-        self.image_token = image_token
-        self.image_token_len = image_token_len
-        self.image_size = image_size
+        self.image_token_id = image_token_id
+        self.vision_cfg = vision_cfg
         self.path = str(data_path)
         self.pf = pq.ParquetFile(self.path)
         self.row_group_size = row_group_size
@@ -140,10 +140,36 @@ class MultimodalDataset(Dataset):
     def __len__(self):
         return self.pf.metadata.num_rows
 
+    def _image_inputs(self, prompt_ids, raw_images):
+        """把 prompt 里的 image_token 占位展开成参考实现图像 span。
+
+        输入：prompt_ids list[int]；raw_images list[bytes]。
+        输出：(tokens list[int], token_types list[int], images list[ImageInput])。
+        预期行为：占位符处插入 IMAGE_START/IMAGE/NEW_LINE/END 布局，并记录每张图的 patch。
+        """
+        from model.image_processor import (ImageInput, TEXT, image_token_types,
+                                           load_image_from_bytes)
+
+        vc = self.vision_cfg
+        tokens, token_types, images = [], [], []
+        img_iter = iter(raw_images)
+        for tok in prompt_ids:
+            if tok != self.image_token_id:
+                tokens.append(tok)
+                token_types.append(TEXT)
+                continue
+            raw = next(img_iter)
+            patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = load_image_from_bytes(
+                raw, vc.patch_size, vc.downsample_ratio, vc.max_image_tokens,
+                vc.min_pixels, vc.max_wh_ratio)
+            types = image_token_types(n_llm_h, n_llm_w)
+            images.append(ImageInput(len(tokens), patches, n_vit_h, n_vit_w, types))
+            tokens += [self.image_token_id] * types.numel()
+            token_types += types.tolist()
+        return tokens, token_types, images
+
     def __getitem__(self, index):
-        import io
         import json
-        from PIL import Image
 
         # 不整表加载（数 GB）：按全局行号定位所属 row group，再读那一组
         rg, offset = 0, index
@@ -155,13 +181,11 @@ class MultimodalDataset(Dataset):
         if isinstance(convs, str):
             convs = json.loads(convs)
         raw = row.get("image_bytes")
-        image = None
+        # 有图：把 `<image>` 换成 image_token 占位（一个），随后由 _image_inputs 展开成 span
         if raw:
-            image = Image.open(io.BytesIO(raw)).convert("RGB")
-            image = image.resize((self.image_size, self.image_size), Image.BICUBIC)
-            placeholder = self.image_token * self.image_token_len
             convs = [{"role": c["role"],
-                      "content": str(c["content"]).replace(self.image_placeholder, placeholder)}
+                      "content": str(c["content"]).replace(
+                          self.image_placeholder, self.tokenizer.decode([self.image_token_id]))}
                      for c in convs]
         out = self.tokenizer.apply_chat_template(
             convs, tokenize=True, add_generation_prompt=False,
@@ -169,8 +193,18 @@ class MultimodalDataset(Dataset):
         ids = out["input_ids"] if hasattr(out, "keys") else out
         if ids and isinstance(ids[0], list):
             ids = ids[0]
+        ids = list(ids)
+
+        token_types = [(-1)] * len(ids)
+        images = []
+        if raw:
+            ids, token_types, images = self._image_inputs(ids, [raw])
+
         pad = self.tokenizer.pad_token_id
-        input_ids = list(ids) + [pad] * (self.max_length - len(ids))
+        input_ids = ids[:self.max_length] + [pad] * max(0, self.max_length - len(ids))
+        token_types = token_types[:self.max_length] + [-1] * max(0, self.max_length - len(token_types))
         labels = [(-100 if v == pad else v) for v in input_ids]
         return {"input_ids": torch.tensor(input_ids),
-                "labels": torch.tensor(labels), "image": image}
+                "labels": torch.tensor(labels),
+                "token_types": torch.tensor(token_types),
+                "images": images}
