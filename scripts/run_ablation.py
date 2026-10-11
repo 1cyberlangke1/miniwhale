@@ -33,7 +33,7 @@ def run_stage(stage, loader, tokenizer, args):
     cfg = make_ablation(stage)
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     n_params = sum(p.numel() for p in model.parameters())
-    muon, adamw = make_optimizers(model, lr=args.lr)
+    muon, adamw, sinkhorn = make_optimizers(model, lr=args.lr)
     model.train()
 
     losses = []
@@ -57,7 +57,8 @@ def run_stage(stage, loader, tokenizer, args):
         if not torch.isfinite(gn):
             print(f"  [{stage}] step {step} 梯度非有限，停止本阶段")
             break
-        muon.step(); adamw.step(); muon.zero_grad(); adamw.zero_grad()
+        muon.step(); adamw.step(); sinkhorn.step()
+        muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad()
         losses.append(loss.item())
         if step % 20 == 0:
             print(f"  {stage} step {step}/{args.steps} loss {loss.item():.4f}")

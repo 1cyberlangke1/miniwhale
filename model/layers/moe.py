@@ -65,6 +65,10 @@ class Gate(nn.Module):
 
         self.weight = nn.Parameter(torch.empty(self.n_routed, self.dim))
         self.bias = nn.Parameter(torch.zeros(self.n_routed, dtype=torch.float32))
+        # 图像 span 用单独的路由 bias（参考实现 noaux_tc_for_vl）；仅 vision_enabled 时存在
+        self.vision_enabled = getattr(text_cfg, "vision_enabled", False)
+        self.bias_vl = (nn.Parameter(torch.zeros(self.n_routed, dtype=torch.float32))
+                        if self.vision_enabled else None)
         # 负载均衡用的每专家 token 计数（非梯度更新，见 update_bias）
         self.register_buffer("tokens_per_expert", torch.zeros(self.n_routed, dtype=torch.float32),
                              persistent=False)
@@ -99,7 +103,8 @@ class Gate(nn.Module):
         self.bias.add_(torch.sign(offset) * rate)
         self.tokens_per_expert.zero_()
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None):
+        """x [n, dim]；image_mask [n]（True=图像 span token，用单独路由 bias）。"""
         # 参考实现：scores = linear(x, weight) / gate_temp
         scores = F.linear(x.float(), self.weight.float()) / self.gate_temp
         if self.scoring_func == "softmax":
@@ -108,8 +113,11 @@ class Gate(nn.Module):
             scores = scores.sigmoid()
         else:  # sqrtsoftplus
             scores = F.softplus(scores).sqrt()
-        # bias 只挑专家，不缩放：权重取未加 bias 的原始分
-        indices = (scores + self.bias).topk(self.topk, dim=-1)[1]
+        # 图像 token 用 bias_vl（参考实现 noaux_tc_for_vl）；bias 只挑专家，不缩放
+        bias = self.bias
+        if image_mask is not None and self.bias_vl is not None:
+            bias = torch.where(image_mask.unsqueeze(-1), self.bias_vl, bias)
+        indices = (scores + bias).topk(self.topk, dim=-1)[1]
         if self.training:
             with torch.no_grad():  # 累计每专家被选次数（供 update_bias）
                 self.tokens_per_expert += torch.bincount(
@@ -145,12 +153,12 @@ class MoE(nn.Module):
             self.experts = nn.ModuleList([Expert(self.dim, inter, lim) for _ in range(self.n_routed)])
             self.shared_experts = nn.ModuleList([Expert(self.dim, inter, lim) for _ in range(self.n_shared)])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         if self.dense:
             return self.dense_ffn(x)
         b, L, d = x.shape
         flat = x.reshape(-1, d)
-        weights, indices = self.gate(flat)
+        weights, indices = self.gate(flat, None if image_mask is None else image_mask.flatten())
 
         # 累加器用 fp32（一致），最后转回输入 dtype
         out = torch.zeros_like(flat, dtype=torch.float32)

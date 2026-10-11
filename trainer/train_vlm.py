@@ -68,10 +68,10 @@ def collate_fn(batch):
     return {"input_ids": input_ids, "labels": labels, "images": images}
 
 
-def train_epoch(epoch, loader, model, vit, aligner, muon, adamw, vit_opt, args, start_step=0):
+def train_epoch(epoch, loader, model, vit, aligner, muon, adamw, sinkhorn, vit_opt, args, start_step=0):
     """跑一个 epoch（图像注入 + 文本交叉熵）。
 
-    输入：epoch；loader；model；vit；aligner；主干优化器 muon/adamw；ViT/Aligner 优化器 vit_opt；args；start_step。
+    输入：epoch；loader；model；vit；aligner；主干优化器 muon/adamw/sinkhorn；ViT/Aligner 优化器 vit_opt；args；start_step。
     输出：本 epoch 平均 loss。
     预期行为：每步把图像编码成 embeds 注入主干，反向传播更新 ViT/Aligner/主干。
     """
@@ -94,8 +94,8 @@ def train_epoch(epoch, loader, model, vit, aligner, muon, adamw, vit_opt, args, 
             torch.nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(vit.parameters()) + list(aligner.parameters()),
                 args.grad_clip)
-            muon.step(); adamw.step(); vit_opt.step()
-            muon.zero_grad(); adamw.zero_grad(); vit_opt.zero_grad()
+            muon.step(); adamw.step(); sinkhorn.step(); vit_opt.step()
+            muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad(); vit_opt.zero_grad()
             model.update_router_bias(args.router_bias_rate)
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
@@ -142,13 +142,13 @@ def main():
                         num_workers=args.num_workers, collate_fn=collate_fn)
 
     # 主干用参考实现优化器分组；ViT/Aligner 用 AdamW（新增模块）
-    muon, adamw = make_optimizers(model, lr=args.learning_rate)
+    muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
     vit_opt = torch.optim.AdamW(list(vit.parameters()) + list(aligner.parameters()),
                                 lr=args.learning_rate)
 
     os.makedirs(args.save_dir, exist_ok=True)
     for epoch in range(args.epochs):
-        loss = train_epoch(epoch, loader, model, vit, aligner, muon, adamw, vit_opt, args)
+        loss = train_epoch(epoch, loader, model, vit, aligner, muon, adamw, sinkhorn, vit_opt, args)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")
 
     torch.save({"model": model.state_dict(), "vit": vit.state_dict(),

@@ -48,7 +48,7 @@ def run_one(bucket, loader, tokenizer, args, log):
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     n_engram = sum(p.numel() for n, p in model.named_parameters() if "engram" in n)
     n_total = sum(p.numel() for p in model.parameters())
-    muon, adamw = make_optimizers(model, lr=args.lr)
+    muon, adamw, sinkhorn = make_optimizers(model, lr=args.lr)
     model.train()
 
     losses, it = [], iter(loader)
@@ -69,7 +69,8 @@ def run_one(bucket, loader, tokenizer, args, log):
         gn = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         if not torch.isfinite(gn):
             log(f"  bucket {bucket} 梯度非有限，停止"); break
-        muon.step(); adamw.step(); muon.zero_grad(); adamw.zero_grad()
+        muon.step(); adamw.step(); sinkhorn.step()
+        muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad()
         losses.append(loss.item())
     dt = time.time() - t0
     log(f"bucket {bucket:6d}: engram {n_engram/1e6:5.1f}M / total {n_total/1e6:5.1f}M "

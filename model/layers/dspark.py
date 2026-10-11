@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from model.layers.attention import Attention, get_window_topk_idxs
-from model.nn.linear import Linear
+from model.nn.linear import Head, Linear
 from model.nn.norm import RMSNorm
 from model.nn.quant import fake_quant_fp8
 from model.nn.rope import apply_rotary_emb
@@ -236,7 +236,7 @@ class DSparkMarkovHead(nn.Module):
     def __init__(self, vocab_size: int, rank: int):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, rank)
-        self.head = Linear(rank, vocab_size, bias=False)
+        self.head = Head(rank, vocab_size)
 
     def forward(self, token_ids: torch.Tensor):
         embed = self.embed(token_ids)
@@ -301,7 +301,12 @@ class DSparkBlock(nn.Module):
         self.noise_token_id = text_cfg.dspark_noise_token_id
 
         self.attn = DSparkAttention(text_cfg, layer_id)
-        self.ffn = MoE(text_cfg)
+        # 参考实现 get_moe_config：DSpark 层用 dspark_n_routed_experts（0 则回退主干）
+        from dataclasses import replace
+        dspark_n = getattr(text_cfg, "dspark_n_routed_experts", 0) or text_cfg.n_routed_experts
+        dspark_k = getattr(text_cfg, "dspark_num_experts_per_tok", 0) or text_cfg.num_experts_per_tok
+        moe_cfg = replace(text_cfg, n_routed_experts=dspark_n, num_experts_per_tok=dspark_k)
+        self.ffn = MoE(moe_cfg)
         self.attn_norm = RMSNorm(text_cfg.hidden_size, text_cfg.rms_norm_eps)
         self.ffn_norm = RMSNorm(text_cfg.hidden_size, text_cfg.rms_norm_eps)
         self.hc = HyperConnection(text_cfg)

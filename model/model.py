@@ -15,7 +15,7 @@ from torch import nn
 from model.layers.attention import Attention, SharedAttentionRuntime
 from model.layers.engram import Engram
 from model.layers.engram_hash import EngramHash
-from model.nn.linear import Linear
+from model.nn.linear import Head, Linear
 from model.layers.mhc import HyperConnection
 from model.layers.moe import MoE
 from model.nn.norm import RMSNorm
@@ -39,10 +39,12 @@ class Block(nn.Module):
         self.hc = HyperConnection(text_cfg)
         self.engram = Engram(text_cfg, layer_id) if layer_id in text_cfg.engram_layer_ids else None
 
-    def forward(self, x, start_pos, pre_mix, *attn_args, engram_hashes=None, token_mask=None):
+    def forward(self, x, start_pos, pre_mix, *attn_args, engram_hashes=None, token_mask=None,
+                image_mask=None):
         """attn_args 透传给 attention（普通块传 shared 运行时；DSpark 块传 main_x）。
 
-        输入：x [B,L,hc,dim]；start_pos；pre_mix；attn_args；engram_hashes；token_mask。
+        输入：x [B,L,hc,dim]；start_pos；pre_mix；attn_args；engram_hashes；token_mask；
+              image_mask [B,L]（True=图像 span token，MoE 用单独路由 bias）。
         输出：(x, ffn_pre)。
         预期行为：attn 用上一层传的 pre_mix，FFN 用本层 attn 产的 pre_mix（single-pass 错位）。
         """
@@ -59,7 +61,7 @@ class Block(nn.Module):
         ffn_pre, ffn_post, ffn_comb = self.hc.hc_mixes(x, "ffn")
         h = self.hc.hc_pre(x, attn_pre)
         h = self.ffn_norm(h)
-        h = self.ffn(h)
+        h = self.ffn(h, image_mask)
         x = self.hc.hc_post(h, residual, ffn_post, ffn_comb)
         return x, ffn_pre
 
@@ -80,7 +82,7 @@ class Model(nn.Module):
         self.embed = nn.Embedding(tc.vocab_size, tc.hidden_size)
         self.layers = nn.ModuleList([Block(tc, i) for i in range(tc.num_hidden_layers)])
         self.norm = RMSNorm(tc.hidden_size, tc.rms_norm_eps)
-        self.head = Linear(tc.hidden_size, tc.vocab_size, bias=False)
+        self.head = Head(tc.hidden_size, tc.vocab_size)
         has_engram = bool(tc.engram_layer_ids) and len(tc.engram_num_embeddings) > 0
         self.engram_hash = EngramHash(tc, tokenizer) if (tokenizer is not None and has_engram) else None
         self.shared = SharedAttentionRuntime()
@@ -110,6 +112,10 @@ class Model(nn.Module):
         if self.engram_hash is not None:
             engram_hashes = self.engram_hash(input_ids, token_mask)  # [B,L,n_layers,n_hash_cols]
 
+        # 图像 span 掩码：MoE 对图像 token 用单独路由 bias（参考实现 noaux_tc_for_vl）
+        img_id = getattr(tc, "image_token_id", None)
+        image_mask = (input_ids == img_id) if (img_id is not None and image_embeds is not None) else None
+
         h = self.embed(input_ids)                       # [B,L,dim]
         if image_embeds is not None:
             h = self.merge_image_embeds(input_ids, h, image_embeds)
@@ -130,7 +136,7 @@ class Model(nn.Module):
             if i in self.target_layer_ids:
                 main_hiddens.append(h.mean(dim=2))
             h, pre_mix = layer(h, start_pos, pre_mix, self.shared,
-                               engram_hashes=eh, token_mask=token_mask)
+                               engram_hashes=eh, token_mask=token_mask, image_mask=image_mask)
 
         h = self.layers[-1].hc.hc_pre(h, pre_mix)  # 折叠成 1 份
         hidden = self.norm(h)

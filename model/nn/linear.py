@@ -82,3 +82,30 @@ class Linear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return nn.functional.linear(x, self.weight, self.bias)
+
+
+class Head(nn.Module):
+    """预测头（LM Head / Markov Head）—— 按参考实现 ParallelHead 的精度语义。
+
+    输入：x [..., in_features]（bf16）。
+    输出：[..., out_features]，**fp32**。
+    预期行为：权重存 **fp32**（参考实现 ParallelHead 显式 dtype=torch.float32，注释说 checkpoint
+              里是 bf16、这里存 fp32 以便 logits 直接 fp32 输出）；前向 `F.linear(x.float(), weight)`。
+    """
+
+    def __init__(self, in_features: int, out_features: int, initializer_range: float = 0.02):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.initializer_range = initializer_range
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.float32))
+        self.reset_parameters()
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        """正态初始化权重（std=initializer_range）。"""
+        self.weight.copy_(
+            torch.randn(self.out_features, self.in_features, dtype=torch.float32) * self.initializer_range)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.linear(x.float(), self.weight)

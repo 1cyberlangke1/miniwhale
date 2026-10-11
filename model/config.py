@@ -40,6 +40,11 @@ class TextConfig:
     initializer_range: float = 0.02
     max_position_embeddings: int = 32768
     rope_theta: float = 10000.0
+    # YaRN 外推：original_seq_len>0 时对压缩层（用 compress_rope_theta）启用
+    original_seq_len: int = 0
+    rope_factor: float = 40.0
+    beta_fast: int = 32
+    beta_slow: int = 1
 
     # MoE：V4.1 式（sqrtsoftplus 打分 + noaux_tc bias + 共享专家）
     n_routed_experts: int = 4
@@ -49,6 +54,9 @@ class TextConfig:
     topk_method: str = "noaux_tc"
     norm_topk_prob: bool = True
     routed_scaling_factor: float = 1.5
+    gate_temp: float = 1.0
+    # 多模态：图像 span token 用单独的路由 bias（参考实现 noaux_tc_for_vl）
+    vision_enabled: bool = True
 
     # CSA2 / 跨层共享
     sliding_window: int = 128

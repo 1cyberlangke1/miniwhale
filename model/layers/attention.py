@@ -122,11 +122,14 @@ class Attention(nn.Module):
 
         if self.compress_ratio:
             rope_base = text_cfg.compress_rope_theta
+            original_seq_len = getattr(text_cfg, "original_seq_len", 0)
         else:
+            # 纯滑窗层：禁用 YaRN，用 base rope_theta（同样结构）
             rope_base = text_cfg.rope_theta
+            original_seq_len = 0
         self.register_buffer(
             "freqs_cis",
-            _precompute(text_cfg, rope_base),
+            _precompute(text_cfg, rope_base, original_seq_len),
             persistent=False,
         )
 
@@ -304,12 +307,21 @@ class Attention(nn.Module):
             idxs = torch.empty(bsz, seqlen, 0, dtype=torch.int32, device=x.device)
         else:
             assert self.indexer is not None
-            idxs = self.indexer(x, qr, shared.index_k, compress_lens, shared.candidates, offset)
+            # 参考实现：indexer 的 q 用 attention 层的 freqs_cis（Indexer.freqs_cis = Attention.freqs_cis）
+            if self.indexer.freqs_cis is None:
+                self.indexer.freqs_cis = self.freqs_cis
+            idxs = self.indexer(x, qr, shared.index_k, compress_lens, shared.candidates,
+                                offset, start_pos)
         shared.topk_idxs = idxs
         return idxs
 
 
-def _precompute(text_cfg, rope_base):
+def _precompute(text_cfg, rope_base, original_seq_len=0):
     from model.nn.rope import precompute_freqs_cis
 
-    return precompute_freqs_cis(text_cfg.qk_rope_head_dim, text_cfg.max_position_embeddings, rope_base)
+    return precompute_freqs_cis(
+        text_cfg.qk_rope_head_dim, text_cfg.max_position_embeddings, rope_base,
+        original_seq_len=original_seq_len,
+        factor=getattr(text_cfg, "rope_factor", 40.0),
+        beta_fast=getattr(text_cfg, "beta_fast", 32),
+        beta_slow=getattr(text_cfg, "beta_slow", 1))

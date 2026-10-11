@@ -25,10 +25,10 @@ from model.train.optim import make_optimizers
 from model.tokenizer import load_tokenizer
 
 
-def train_epoch(epoch, loader, model, muon, adamw, args, start_step=0):
+def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0):
     """跑一个 epoch。
 
-    输入：epoch；loader；model；两个优化器；args；start_step（续训）。
+    输入：epoch；loader；model；三个优化器（Muon/AdamW/Sinkhorn）；args；start_step（续训）。
     输出：本 epoch 的平均 loss。
     预期行为：bf16 autocast 前向；交叉熵只算 assistant 段（非 -100）；梯度累积 + 裁剪。
     """
@@ -50,8 +50,8 @@ def train_epoch(epoch, loader, model, muon, adamw, args, start_step=0):
         loss.backward()
         if (step + 1) % args.accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            muon.step(); adamw.step()
-            muon.zero_grad(); adamw.zero_grad()
+            muon.step(); adamw.step(); sinkhorn.step()
+            muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad()
             model.update_router_bias(args.router_bias_rate)
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
@@ -97,10 +97,10 @@ def main():
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.num_workers, pin_memory=True)
 
-    muon, adamw = make_optimizers(model, lr=args.learning_rate)
+    muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
     os.makedirs(args.save_dir, exist_ok=True)
     for epoch in range(args.epochs):
-        loss = train_epoch(epoch, loader, model, muon, adamw, args)
+        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")
     torch.save(model.state_dict(), os.path.join(args.save_dir, "sft.pth"))
     print("SFT 完成，已保存 sft.pth")

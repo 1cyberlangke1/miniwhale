@@ -15,6 +15,7 @@ from torch import nn
 
 from model.nn.norm import RMSNorm
 from model.nn.quant import fake_quant_fp4
+from model.nn.rope import apply_rotary_emb
 
 
 def select_candidate_blocks(
@@ -74,11 +75,18 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False, dtype=torch.bfloat16)
         self.wk = nn.Linear(text_cfg.head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16)
         self.k_norm = RMSNorm(self.index_head_dim, text_cfg.rms_norm_eps)
+        # 参考实现：indexer 的 q 用 attention 层的 freqs_cis 施加 RoPE（Indexer.freqs_cis = Attention.freqs_cis）
+        self.freqs_cis = None
 
-    def score(self, x: torch.Tensor, qr: torch.Tensor, index_k: torch.Tensor) -> torch.Tensor:
+    def score(self, x: torch.Tensor, qr: torch.Tensor, index_k: torch.Tensor,
+              start_pos: int = 0) -> torch.Tensor:
         """算每个 query 对每个压缩位置的分数。x [B,L,dim] → [B,L,T]。"""
         dtype = x.dtype
         q = self.wq_b(qr.to(self.wq_b.weight.dtype)).unflatten(-1, (self.n_heads, self.index_head_dim)).to(dtype)
+        # 参考实现：对 indexer 的 q 施加 RoPE（末 rope_head_dim 维）
+        if self.freqs_cis is not None:
+            seqlen = q.size(1)
+            apply_rotary_emb(q[..., -self.rope_head_dim:], self.freqs_cis[start_pos:start_pos + seqlen])
         # 参考实现对 indexer 的 q/k 做 FP4 量化（fp4_act_quant, block=32, E8M0 scale）
         q = fake_quant_fp4(q, block_size=32)
         weights = self.weights_proj(x.to(self.weights_proj.weight.dtype)).to(dtype) \
@@ -118,8 +126,9 @@ class Indexer(nn.Module):
         compress_lens: torch.Tensor | int,
         candidates: torch.Tensor | None = None,
         offset: int = 0,
+        start_pos: int = 0,
     ) -> torch.Tensor:
-        index_score = self.score(x, qr, index_k)  # [B, L, T]
+        index_score = self.score(x, qr, index_k, start_pos)  # [B, L, T]
         self._last_score = index_score  # 供 indexer_loss 使用（不参与主 loss 梯度）
         end = index_k.size(1)
 
