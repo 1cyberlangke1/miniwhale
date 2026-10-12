@@ -13,6 +13,12 @@ import sys
 import time
 from pathlib import Path
 
+# **必须在 import torch 之前**设：`torch._inductor.config` 首次 import 时用
+# `os.getenv(..., 默认)` 读取，之后设就无效。compile_threads=1：Windows 上多线程
+# 编译会走 SubprocPool 的 pass_fds → CPython 断言崩溃。不调 autotune warmup/rep
+# （调小等于拿 kernel 质量换编译时间）。
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -67,9 +73,6 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
         set_base_lr((muon, adamw, sinkhorn), lr)
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)
-        # CUDA Graph（reduce-overhead）在训练里必须每步标记前向起点，否则上一步输出仍待
-        # 反向、录制的图走不了 fast path（torch 参考实现提示：`cudagraph_mark_step_begin()`）。
-        torch.compiler.cudagraph_mark_step_begin()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits, _ = model(ids)
             loss = torch.nn.functional.cross_entropy(
@@ -147,8 +150,7 @@ def main():
     parser.add_argument("--compile", action="store_true",
                         help="用 torch.compile 加速前向/反向（训练用；推理对拍走 eager 保逐位一致）")
     parser.add_argument("--compile_mode", type=str, default="default",
-                        help='torch.compile 模式：默认 "default"。不用 "reduce-overhead"（CUDA Graphs）'
-                             '——它与本模型的动态 MoE shape + 梯度累积冲突（backward 图被覆盖报错）。')
+                        help='torch.compile 模式（固定 "default"）。')
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()

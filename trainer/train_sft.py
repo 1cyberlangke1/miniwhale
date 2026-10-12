@@ -13,6 +13,10 @@ import sys
 import time
 from pathlib import Path
 
+# **必须在 import torch 之前**设（torch._inductor.config 首次 import 时读 env）。
+# compile_threads=1：Windows 上多线程编译会走 SubprocPool 的 pass_fds → CPython 断言崩溃。
+os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -123,9 +127,9 @@ def main():
     parser.add_argument("--keep_last_n", type=int, default=3,
                         help="只保留最近 N 个 checkpoint（0=全留）")
     parser.add_argument("--compile", action="store_true",
-                        help="用 torch.compile 加速训练（emulate_precision_casts 保数值）")
+                        help="用 torch.compile 加速训练（保持 inductor 默认数值语义）")
     parser.add_argument("--compile_mode", type=str, default="default",
-                        help='torch.compile 模式："default" / "reduce-overhead"')
+                        help='torch.compile 模式（固定 "default"）')
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
