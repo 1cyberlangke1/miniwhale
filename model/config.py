@@ -62,6 +62,8 @@ class TextConfig:
     norm_topk_prob: bool = True
     routed_scaling_factor: float = 1.5
     gate_temp: float = 1.0
+    # 序列级平衡损失权重（noaux_tc 的兜底项，防单序列内极端偏斜）
+    seq_aux_loss_alpha: float = 1e-4
     # 多模态：图像 span token 用单独的路由 bias（参考实现 noaux_tc_for_vl）
     vision_enabled: bool = True
     # 图像占位 token 的 id（参考实现 image_token_id）；minimind 词表里 <|image_pad|> = 12

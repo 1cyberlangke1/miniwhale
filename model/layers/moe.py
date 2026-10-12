@@ -17,6 +17,24 @@ from torch import nn
 from model.nn.norm import RMSNorm  # noqa: F401
 
 
+class _AuxLossScaler(torch.autograd.Function):
+    """把 MoE 序列级平衡损失挂到模块输出上：前向透传，反向以**单位梯度**注入其梯度。
+
+    预期行为：前向返回 output 本身；反向对 output 的梯度原样透传，对 aux_loss 的梯度置 1，
+              使 aux_loss 在后续 backward 中按自身权重（α）参与梯度。与参考实现 AddAuxiliaryLoss 同构。
+    """
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(aux_loss)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (aux_loss,) = ctx.saved_tensors
+        return grad_output, torch.ones_like(aux_loss)
+
+
 class Expert(nn.Module):
     """一个 SwiGLU FFN 专家。
 
@@ -62,6 +80,7 @@ class Gate(nn.Module):
         self.norm_topk_prob = text_cfg.norm_topk_prob
         self.route_scale = text_cfg.routed_scaling_factor
         self.gate_temp = getattr(text_cfg, "gate_temp", 1.0)
+        self.aux_loss_alpha = getattr(text_cfg, "seq_aux_loss_alpha", 1e-4)
 
         self.weight = nn.Parameter(torch.empty(self.n_routed, self.dim))
         self.bias = nn.Parameter(torch.zeros(self.n_routed, dtype=torch.float32))
@@ -104,7 +123,12 @@ class Gate(nn.Module):
         self.tokens_per_expert.zero_()
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None):
-        """x [n, dim]；image_mask [n]（True=图像 span token，用单独路由 bias）。"""
+        """x [n, dim]；image_mask [n]（True=图像 span token，用单独路由 bias）。
+
+        输出：(weights [n, topk], indices [n, topk], aux_loss 标量或 None)。
+        预期行为：aux_loss 为序列级平衡损失（noaux_tc 的兜底项，防单序列内极端偏斜），
+                  仅训练时计算；权重/选择路径不受其影响。
+        """
         # 参考实现：scores = linear(x, weight) / gate_temp
         scores = F.linear(x.float(), self.weight.float()) / self.gate_temp
         if self.scoring_func == "softmax":
@@ -118,6 +142,20 @@ class Gate(nn.Module):
         if image_mask is not None and self.bias_vl is not None:
             bias = torch.where(image_mask.unsqueeze(-1), self.bias_vl, bias)
         indices = (scores + bias).topk(self.topk, dim=-1)[1]
+        # 序列级平衡损失（α 极小，兜底防极端偏斜，参考实现 V4.1 报告 §训练超参）。
+        # 仅在训练时计算；权重/选择路径不受其影响。
+        aux_loss = None
+        if self.training and self.aux_loss_alpha > 0.0:
+            n = indices.size(0)
+            n_seq = self.topk * n
+            # f_i：专家 i 被选中比例 × n_routed（Eq 18）
+            ce = torch.zeros(n, self.n_routed, device=x.device, dtype=scores.dtype)
+            ce.scatter_add_(1, indices, torch.ones_like(indices, dtype=scores.dtype))
+            f_i = ce.sum(dim=0) * (self.n_routed / n_seq)
+            # P_i：专家 i 的平均归一化亲和分（Eq 19-20）
+            s_norm = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+            P_i = s_norm.mean(dim=0)
+            aux_loss = self.aux_loss_alpha * (f_i * P_i).sum()
         if self.training:
             with torch.no_grad():  # 累计每专家被选次数（供 update_bias）
                 self.tokens_per_expert += torch.bincount(
@@ -126,7 +164,7 @@ class Gate(nn.Module):
         if self.norm_topk_prob and self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
         weights = weights * self.route_scale
-        return weights, indices
+        return weights, indices, aux_loss
 
 
 class MoE(nn.Module):
@@ -158,7 +196,7 @@ class MoE(nn.Module):
             return self.dense_ffn(x)
         b, L, d = x.shape
         flat = x.reshape(-1, d)
-        weights, indices = self.gate(flat, None if image_mask is None else image_mask.flatten())
+        weights, indices, aux_loss = self.gate(flat, None if image_mask is None else image_mask.flatten())
 
         # 累加器用 fp32（一致），最后转回输入 dtype。
         # 逐专家循环用 `torch.where(indices == i)` 取命中的 token：动态长度留在图内由 dynamo
@@ -173,4 +211,8 @@ class MoE(nn.Module):
             y[idx] += expert(flat[idx], weights[idx, top, None])
         for shared in self.shared_experts:
             y += shared(flat)
-        return y.view(b, L, d).to(x.dtype)
+        out = y.view(b, L, d).to(x.dtype)
+        # 序列级平衡损失挂到输出（前向值不变，反向注入其梯度）——自动汇入主 loss 的反向图
+        if aux_loss is not None:
+            out = _AuxLossScaler.apply(out, aux_loss)
+        return out
