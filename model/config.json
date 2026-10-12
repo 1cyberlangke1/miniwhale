@@ -70,7 +70,8 @@
     ],
     "compress_rope_theta": 160000,
     "kv_source_layer_ids": [
-      2
+      2,
+      4
     ],
     "index_source_layer_ids": [
       2,

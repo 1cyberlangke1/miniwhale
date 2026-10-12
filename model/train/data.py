@@ -38,8 +38,10 @@ class PretrainDataset(IterableDataset):
         self.seed = seed
         self.samples = load_dataset("json", data_files=self.path, split="train",
                                     streaming=streaming)
-        # 行数：datasets 对本地 jsonl 已统计，流式/非流式都在 info.splits 里给，直接用
-        self.num_rows = self.samples.info.splits["train"].num_examples
+        # 行数：datasets 对本地 jsonl 已统计，流式/非流式都在 info.splits 里给，直接用。
+        # 极小的临时文件 datasets 可能不给 splits（None）——回退 0，调用方按 0 处理。
+        splits = getattr(self.samples.info, "splits", None)
+        self.num_rows = splits["train"].num_examples if splits and "train" in splits else 0
 
     def _encode(self, text: str):
         tokens = self.tokenizer(str(text), add_special_tokens=False,
@@ -89,8 +91,10 @@ class SFTDataset(IterableDataset):
         self.seed = seed
         self.samples = load_dataset("json", data_files=self.path, split="train",
                                     streaming=streaming)
-        # 行数：datasets 对本地 jsonl 已统计，流式/非流式都在 info.splits 里给，直接用
-        self.num_rows = self.samples.info.splits["train"].num_examples
+        # 行数：datasets 对本地 jsonl 已统计，流式/非流式都在 info.splits 里给，直接用。
+        # 极小的临时文件 datasets 可能不给 splits（None）——回退 0，调用方按 0 处理。
+        splits = getattr(self.samples.info, "splits", None)
+        self.num_rows = splits["train"].num_examples if splits and "train" in splits else 0
         # assistant 段起止标记（照 minimind：`<|im_start|>assistant\n` ... `<|im_end|>\n`）
         self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant\n",
                                 add_special_tokens=False).input_ids
