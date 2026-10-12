@@ -24,7 +24,7 @@ def make_ablation(stage: str) -> ModelConfig:
     """
     cfg = ModelConfig.from_json()
     tc = cfg.text
-    # 基线：纯 dense（无 MoE / mHC / 跨层共享 / Engram）
+    # 基线：纯 dense（无 MoE / mHC / CSA2 / Engram）
     tc.n_routed_experts = 0
     tc.n_shared_experts = 0
     tc.num_experts_per_tok = 0

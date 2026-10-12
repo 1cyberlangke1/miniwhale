@@ -237,6 +237,12 @@ class Attention(nn.Module):
         输出：[B,L,H,D]。
         预期行为：对每个 query 只对其 idxs 指向的 KV 做 softmax 注意力；
               -1 位置被屏蔽；拼接 attn_sink 参与 softmax。
+
+        数值：**逐算子按参考实现 `sparse_attn_kernel` 复刻**（tilelang）：
+        - QK^T 与 PV 都是 bf16 输入、fp32 累加（kernel 的 `T.gemm` 输出 fp32）。
+        - softmax 的 exp 结果先转 bf16（kernel 的 `acc_s_cast` 是 BF16）再算 PV。
+        - sink 作为额外一项加在分母（`sum_exp += exp(sink - max)`），不参与 PV。
+        若把 exp 留 fp32、或先归一化再算 PV，会与参考实现差 ~1e-2（bf16 舍入点不同）。
         """
         b, L, H, D = q.shape
         T = kv.size(1)
@@ -246,15 +252,18 @@ class Attention(nn.Module):
         valid = idxs >= 0
         safe = idxs.clamp_min(0)
         k_sel = kf.unsqueeze(1).expand(b, L, T, D).gather(2, safe.unsqueeze(-1).expand(-1, -1, -1, D))
+        # QK^T：bf16 输入、fp32 累加（此处输入已是 bf16 上转的 fp32，等价 fp32 累加）
         scores = torch.einsum("blhd,blkd->blhk", qf, k_sel) * self.softmax_scale
-        # 参考实现用有限下界 -1e30（非 -inf）：全 -1 行会得到 exp(-inf-(-inf))=NaN，
-        # 有限下界下该行输出全 0，与训练 kernel 约定一致。
-        scores = scores.masked_fill(~valid.unsqueeze(2), -1e30)
-        # attn sink：每个 head 一个额外 logit
-        sink = self.attn_sink.view(1, 1, H, 1).expand(b, L, H, 1)
-        scores = torch.cat([scores, sink], dim=-1)
-        probs = scores.softmax(dim=-1)[..., :-1]
-        out = torch.einsum("blhk,blkd->blhd", probs, k_sel)
+        scores = scores.masked_fill(~valid.unsqueeze(2), -torch.inf)
+        # 在线 softmax（单块）：减 topk 上的最大（**不含 sink**，按参考实现）。
+        # max 下界取 -1e30（按参考实现 `T.fill(scores_max, -1e30)`）：全 -1 行（无有效 KV）时
+        # 避免 exp(-inf - (-inf))=NaN，该行输出退化为全 0。
+        mx = scores.amax(dim=-1, keepdim=True).clamp_min(-1e30)
+        e = (scores - mx).exp()
+        # sink 只进分母：sum_exp = Σ exp(x-max) + exp(sink-max)
+        sum_exp = e.sum(dim=-1) + (self.attn_sink.view(1, 1, H) - mx.squeeze(-1)).exp()
+        # PV：exp 先转 bf16（acc_s_cast），再 bf16 输入、fp32 累加；最后除分母
+        out = torch.einsum("blhk,blkd->blhd", e.to(q.dtype).float(), k_sel) / sum_exp.unsqueeze(-1)
         return out.to(q.dtype)
 
     def _compress_kv(self, x, qr, start_pos, offset, shared):

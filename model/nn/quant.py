@@ -28,11 +28,24 @@ def _fast_round_scale(amax: torch.Tensor, max_inv: float) -> torch.Tensor:
 
 
 def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
-    """舍入到最近 e2m1 网格值（保留符号）。"""
-    grid = _E2M1.to(x.device)
-    a = x.abs().unsqueeze(-1)
-    idx = (a - grid).abs().argmin(dim=-1)
-    return grid[idx] * x.sign()
+    """舍入到最近 e2m1 网格值（**round-half-to-even**，对齐 CUDA `cudaRoundNearest`）。
+
+    输入：x 任意浮点（调用方已 clamp 到 [-6, 6]）。
+    输出：同形状，取值为 ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}。
+    预期行为：恰在两相邻网格值**中点**时取偶数尾数那个——e2m1 里下标为偶数 ⟺ 尾数位为 0，
+              即 round-half-to-even。参考实现 kernel `T.Cast(FP4, ...)` 用 CUDA `cudaRoundNearest`，
+              若此处用「取较小者」会在中点翻错整格（例如 -1.75 应为 -2.0 而非 -1.5）。
+    """
+    vals = _E2M1.to(x.device)
+    a = x.abs()
+    # a 落在 vals[lo, hi] 之间；hi = 首个 >= a 的下标
+    hi = torch.searchsorted(vals, a.contiguous()).clamp(1, vals.numel() - 1)
+    lo = hi - 1
+    vlo, vhi = vals[lo], vals[hi]
+    dlo, dhi = a - vlo, vhi - a
+    # 严格更近取上界；中点时取下标偶数（偶数尾数）那个——相邻两下标恰一奇一偶
+    pick_hi = (dhi < dlo) | ((dhi == dlo) & (hi % 2 == 0))
+    return torch.where(pick_hi, vhi, vlo) * x.sign()
 
 
 def _act_quant_fp8(x, block_size, pow2):
@@ -62,7 +75,8 @@ def _act_quant_fp4(x, block_size, e4m3_scale):
     amax = blocks.abs().amax(dim=-1, keepdim=True)
     if e4m3_scale:  # 压缩 KV：E4M3 scale，全零块也保非零
         amax = amax.clamp_min(FP4_MAX * (2 ** -9))
-        scale = amax / FP4_MAX
+        # 参考实现 `T.Cast(FP8, amax / fp4_max)`：scale 本身先舍入到 e4m3 精度（不是留 fp32）
+        scale = (amax / FP4_MAX).to(torch.float8_e4m3fn).float()
     else:           # indexer：E8M0（2 的幂）
         amax = amax.clamp_min(FP4_MAX * (2 ** -126))
         scale = _fast_round_scale(amax, 1.0 / FP4_MAX)

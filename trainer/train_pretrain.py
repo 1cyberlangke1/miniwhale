@@ -139,8 +139,9 @@ def main():
                         help="从 checkpoint 续训（只恢复模型权重）")
     parser.add_argument("--compile", action="store_true",
                         help="用 torch.compile 加速前向/反向（训练用；推理对拍走 eager 保逐位一致）")
-    parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
-                        help='torch.compile 模式："default" / "reduce-overhead"（CUDA Graphs）')
+    parser.add_argument("--compile_mode", type=str, default="default",
+                        help='torch.compile 模式：默认 "default"。不用 "reduce-overhead"（CUDA Graphs）'
+                             '——它与本模型的动态 MoE shape + 梯度累积冲突（backward 图被覆盖报错）。')
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()

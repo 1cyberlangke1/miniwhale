@@ -88,8 +88,11 @@ class Gate(nn.Module):
         self.vision_enabled = getattr(text_cfg, "vision_enabled", False)
         self.bias_vl = (nn.Parameter(torch.zeros(self.n_routed, dtype=torch.float32))
                         if self.vision_enabled else None)
-        # 负载均衡用的每专家 token 计数（非梯度更新，见 update_bias）
+        # 负载均衡用的每专家 token 计数（非梯度更新，见 update_bias）。
+        # 图像 token 用单独计数（参考实现 §2.1.1：两套 bias 按各自模态的负载独立更新）。
         self.register_buffer("tokens_per_expert", torch.zeros(self.n_routed, dtype=torch.float32),
+                             persistent=False)
+        self.register_buffer("tokens_per_expert_vl", torch.zeros(self.n_routed, dtype=torch.float32),
                              persistent=False)
         self.reset_parameters()
 
@@ -105,6 +108,7 @@ class Gate(nn.Module):
         self.weight.copy_(w.to(self.weight.dtype))
         self.bias.zero_()
         self.tokens_per_expert.zero_()
+        self.tokens_per_expert_vl.zero_()
 
     @torch.no_grad()
     def update_bias(self, rate: float):
@@ -112,8 +116,8 @@ class Gate(nn.Module):
 
         输入：rate 更新步长。
         输出：无（原地）。
-        预期行为：过载专家（token 数 > 均值）减 bias，欠载加 bias；
-                  这是 noaux_tc 的核心，bias **不走梯度**。
+        预期行为：过载专家（token 数 > 均值）减 bias，欠载加 bias；文本与图像两套 bias
+                  按各自模态的负载**独立**更新（参考实现 §2.1.1）。bias **不走梯度**。
         """
         if rate <= 0:
             return
@@ -121,6 +125,11 @@ class Gate(nn.Module):
         offset = avg - self.tokens_per_expert
         self.bias.add_(torch.sign(offset) * rate)
         self.tokens_per_expert.zero_()
+        if self.bias_vl is not None:
+            avg_vl = self.tokens_per_expert_vl.mean()
+            offset_vl = avg_vl - self.tokens_per_expert_vl
+            self.bias_vl.add_(torch.sign(offset_vl) * rate)
+            self.tokens_per_expert_vl.zero_()
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None):
         """x [n, dim]；image_mask [n]（True=图像 span token，用单独路由 bias）。
@@ -158,8 +167,16 @@ class Gate(nn.Module):
             aux_loss = self.aux_loss_alpha * (f_i * P_i).sum()
         if self.training:
             with torch.no_grad():  # 累计每专家被选次数（供 update_bias）
-                self.tokens_per_expert += torch.bincount(
-                    indices.flatten(), minlength=self.n_routed).float()
+                if image_mask is not None:
+                    # 图像/文本 token 分别计数（参考实现 §2.1.1：两套 bias 各自独立更新）
+                    img = image_mask.bool()
+                    self.tokens_per_expert += torch.bincount(
+                        indices[~img].flatten(), minlength=self.n_routed).float()
+                    self.tokens_per_expert_vl += torch.bincount(
+                        indices[img].flatten(), minlength=self.n_routed).float()
+                else:
+                    self.tokens_per_expert += torch.bincount(
+                        indices.flatten(), minlength=self.n_routed).float()
         weights = scores.gather(1, indices)
         if self.norm_topk_prob and self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
@@ -199,19 +216,20 @@ class MoE(nn.Module):
         weights, indices, aux_loss = self.gate(flat, None if image_mask is None else image_mask.flatten())
 
         # 累加器用 fp32（一致），最后转回输入 dtype。
-        # 逐专家循环用 `torch.where(indices == i)` 取命中的 token：动态长度留在图内由 dynamo
-        # 符号化，只编译一次。计数用 bincount 仅用于跳过空专家——该分支在图外（tolist 是
-        # 数据依赖的图断点），不参与任何张量形状，故不触发重编译。
-        y = torch.zeros_like(flat, dtype=torch.float32)
-        counts = torch.bincount(indices.flatten(), minlength=self.n_routed).tolist()
+        # 全专家张量化：每个专家对**全部** token 算一遍，再按路由权重掩码累加。
+        # 未选中的 token 权重为 0，`w2(0·h)=0`，加 0 在 fp32 下精确 → 与参考实现逐专家累加逐位一致。
+        # 全静态形状、无 `Tensor.item()`、无数据依赖分支 → torch.compile 可完全融合（不再把
+        # Block.forward 切碎）。代价是专家 FLOPs ×n_experts，但模型是 launch-bound（GPU 13%），
+        # 少而大的 kernel 反而更快。
+        out = torch.zeros_like(flat, dtype=torch.float32)
         for i, expert in enumerate(self.experts):
-            if counts[i] == 0:
-                continue
-            idx, top = torch.where(indices == i)
-            y[idx] += expert(flat[idx], weights[idx, top, None])
+            sel = indices == i                                   # [n_tok, topk]
+            w = torch.where(sel, weights, torch.zeros_like(weights)).sum(-1)  # [n_tok]
+            out += expert(flat, w[:, None].float())
+
         for shared in self.shared_experts:
-            y += shared(flat)
-        out = y.view(b, L, d).to(x.dtype)
+            out = out + shared(flat).float()
+        out = out.view(b, L, d).to(x.dtype)
         # 序列级平衡损失挂到输出（前向值不变，反向注入其梯度）——自动汇入主 loss 的反向图
         if aux_loss is not None:
             out = _AuxLossScaler.apply(out, aux_loss)

@@ -123,10 +123,11 @@ class HyperConnection(nn.Module):
                 post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
         """展开子层输出并混入残差。x [B,L,dim] → [B,L,hc,dim]。
 
-        `comb` 混入项是沿 hc 的收缩（sum over k），用 einsum 直接算：
-        与参考实现 `torch.sum(comb.unsqueeze(-1)*residual.unsqueeze(-2), dim=2)` 数学等价，
-        但避免 [B,L,hc,hc,dim] 的大中间张量与 permute（训练提速的主杠杆）。
+        **必须逐元素求和**（参考实现 `torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)`）：
+        comb 混入项 = `out[i,d] = Σ_j comb[j,i]·res[j,d]`（对 comb 的第一维收缩，即 combᵀ@res）。
+        不能用 einsum/bmm 替代——bmm 走 cublas，累加舍入与逐元素 sum 不同（实测差 ~1e-6，
+        逐层累积会破坏与参考实现的逐位一致）。torch.compile 会把这里的广播乘加融合掉，速度不受损。
         """
-        mixed = torch.einsum("blij,bljd->blid", comb, residual.float())
+        mixed = torch.sum(comb.unsqueeze(-1) * residual.float().unsqueeze(-2), dim=2)
         y = post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed
         return y.type_as(x)
