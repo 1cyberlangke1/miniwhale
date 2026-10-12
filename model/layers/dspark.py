@@ -99,8 +99,8 @@ def _dspark_train_mask(anchor_positions, block_keep_mask, seq_len, block_size, d
 
     输入：anchor_positions [B,N]；block_keep_mask [B,N]；seq_len；block_size；device。
     输出：[B, N*K, S+N*K] bool。
-    预期行为：query 块 j 位置 k 可见 —— context 位置 < anchor[b,j]，或本块 draft 位置 k'<=k；
-              仅当该块 keep 时。
+    预期行为：query 块 j 位置 k 可见 —— context 位置 < anchor[b,j]，或**本块内全部** draft 位置
+              （整块可见，无块内因果；按参考实现 `q_block_id == kv_block_id`）；仅当该块 keep 时。
     """
     bsz, num_blocks = anchor_positions.shape
     q_len = num_blocks * block_size
@@ -179,8 +179,10 @@ class DSparkAttention(Attention):
         k_draft = self.kv_norm(self.wkv(x))                     # [B,Q,head_dim]
 
         ctx_pos = torch.arange(seq_len, device=x.device)
-        ctx_freqs = self.freqs_cis[ctx_pos].unsqueeze(0).expand(bsz, -1, -1)   # [B,S,rd//2]
-        draft_freqs = self.freqs_cis[position_ids]              # [B,Q,rd//2]
+        # freqs 为 [seq, rd//2, 2]（实数 (cos,sin) 存储）；上下文位置对所有样本相同，
+        # 故 unsqueeze(0) 后广播到 batch —— 保持末维 2，得到 [B,S,rd//2,2]。
+        ctx_freqs = self.freqs_cis[ctx_pos].unsqueeze(0).expand(bsz, -1, -1, -1)   # [B,S,rd//2,2]
+        draft_freqs = self.freqs_cis[position_ids]              # [B,Q,rd//2,2]
         k_ctx = _rope_with_freqs(k_ctx.unsqueeze(2), ctx_freqs, rd).squeeze(2)
         q = _rope_with_freqs(q, draft_freqs, rd)
         k_draft = _rope_with_freqs(k_draft.unsqueeze(2), draft_freqs, rd).squeeze(2)

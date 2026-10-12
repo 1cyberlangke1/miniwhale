@@ -161,28 +161,16 @@ class MoE(nn.Module):
         weights, indices = self.gate(flat, None if image_mask is None else image_mask.flatten())
 
         # 累加器用 fp32（一致），最后转回输入 dtype。
-        # 参考实现按专家循环 `torch.where(indices == i)`：布尔 mask 的 where 输出长度是动态的，
-        # 每次迭代触发一次 CUDA 同步（num_experts 次/前向），且是 dynamo 图断点、拖慢编译。
-        # 这里改为**预排序**：一次性 argsort 把 (token, k) 对按专家排好，bincount 出每专家
-        # 计数（唯一一次 D2H 同步），再用累积偏移切段。每个 token 仍只进它选中的专家、
-        # 权重不变 —— 与参考实现逐位等价（由对拍测试保证）。
-        k = indices.size(1)
-        flat_e = indices.reshape(-1)
-        flat_tok = torch.arange(flat.size(0), device=flat.device).repeat_interleave(k)
-        order = torch.argsort(flat_e, stable=True)
-        sort_tok = flat_tok[order]
-        sort_w = weights.reshape(-1)[order]
-        counts = torch.bincount(flat_e, minlength=self.n_routed).tolist()
-        out = torch.zeros_like(flat, dtype=torch.float32)
-        off = 0
+        # 逐专家循环用 `torch.where(indices == i)` 取命中的 token：动态长度留在图内由 dynamo
+        # 符号化，只编译一次。计数用 bincount 仅用于跳过空专家——该分支在图外（tolist 是
+        # 数据依赖的图断点），不参与任何张量形状，故不触发重编译。
+        y = torch.zeros_like(flat, dtype=torch.float32)
+        counts = torch.bincount(indices.flatten(), minlength=self.n_routed).tolist()
         for i, expert in enumerate(self.experts):
-            c = counts[i]
-            if c == 0:
+            if counts[i] == 0:
                 continue
-            toks = sort_tok[off:off + c]
-            out[toks] += expert(flat[toks], sort_w[off:off + c, None].float())
-            off += c
-
+            idx, top = torch.where(indices == i)
+            y[idx] += expert(flat[idx], weights[idx, top, None])
         for shared in self.shared_experts:
-            out = out + shared(flat).float()
-        return out.view(b, L, d).to(x.dtype)
+            y += shared(flat)
+        return y.view(b, L, d).to(x.dtype)

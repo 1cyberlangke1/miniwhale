@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -30,6 +32,22 @@ from model.train.dspark_loss import compute_dspark_loss
 from model.model import Model
 from model.train.compile import maybe_compile
 from model.tokenizer import load_tokenizer
+
+
+def get_lr(step, total_steps, warmup_steps, base_lr, min_lr):
+    """余弦学习率调度（带线性 warmup）。
+
+    输入：step 当前步；total_steps 总步数；warmup_steps 预热步数；base_lr 峰值 lr；min_lr 最低 lr。
+    输出：本步的 lr。
+    预期行为：前 warmup_steps 步从 base_lr/10 线性升到 base_lr；之后按余弦从 base_lr 衰减到 min_lr。
+    """
+    if step < warmup_steps:
+        return base_lr * (0.1 + 0.9 * step / max(warmup_steps, 1))
+    if step >= total_steps:
+        return min_lr
+    ratio = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    cos = 0.5 * (1.0 + math.cos(math.pi * ratio))
+    return min_lr + (base_lr - min_lr) * cos
 
 
 def freeze_backbone(model: Model):
@@ -57,10 +75,20 @@ def main():
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--lr", type=float, default=6e-4, help="参考实现 lr=6e-4")
+    ap.add_argument("--min_lr", type=float, default=6e-5, help="余弦衰减的最低 lr")
+    ap.add_argument("--warmup_steps", type=int, default=100, help="线性预热步数")
+    ap.add_argument("--router_bias_rate", type=float, default=1e-3,
+                    help="noaux_tc 纠正 bias 的更新步长（非梯度）")
     ap.add_argument("--log_interval", type=int, default=50)
+    ap.add_argument("--save_interval", type=int, default=1000,
+                    help="每多少步存一次 checkpoint（0=不存）")
+    ap.add_argument("--keep_last_n", type=int, default=3,
+                    help="只保留最近 N 个 checkpoint（0=全留）")
     ap.add_argument("--save_dir", default="out")
     ap.add_argument("--compile", action="store_true",
                     help="用 torch.compile 加速训练（emulate_precision_casts 保数值）")
+    ap.add_argument("--compile_mode", type=str, default="default",
+                    help='torch.compile 模式："default" / "reduce-overhead"')
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -70,18 +98,22 @@ def main():
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     if args.ckpt:
         model.load_state_dict(torch.load(args.ckpt, map_location=args.device), strict=False)
-    model = maybe_compile(model, args.compile)
+    model = maybe_compile(model, args.compile, args.compile_mode)
     trainable = freeze_backbone(model)
     print(f"DSpark 可训练参数 {sum(p.numel() for p in trainable)/1e6:.2f}M")
 
     ds = PretrainDataset(args.data_path, tokenizer, max_length=args.seq_len)
-    loader = DataLoader(ds, batch_size=args.batch, shuffle=True, num_workers=0)
+    # 数据集是 IterableDataset（流式），自带缓冲打乱，DataLoader 不能再传 shuffle=True
+    loader = DataLoader(ds, batch_size=args.batch, num_workers=0)
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95))
     model.train()
 
     tc = cfg.text
     it = iter(loader)
     for step in range(args.steps):
+        lr = get_lr(step, args.steps, args.warmup_steps, args.lr, args.min_lr)
+        for g in opt.param_groups:
+            g["lr"] = lr
         try:
             batch = next(it)
         except StopIteration:
@@ -106,8 +138,24 @@ def main():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         opt.step()
+        # noaux_tc 纠正 bias 按负载均衡规则更新（非梯度；主干 MoE 冻结但仍需均衡）
+        model.update_router_bias(args.router_bias_rate)
         if step % args.log_interval == 0:
-            print(f"dspark step {step}/{args.steps} loss {loss.item():.4f}")
+            print(f"dspark step {step}/{args.steps} loss {loss.item():.4f} "
+                  f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
+        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
+        if args.save_interval and (step + 1) % args.save_interval == 0:
+            os.makedirs(args.save_dir, exist_ok=True)
+            path = os.path.join(args.save_dir, f"dspark_s{step+1}.pth")
+            torch.save(model.state_dict(), path)
+            if args.keep_last_n:
+                cks = sorted(
+                    (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
+                     if f.startswith("dspark_") and f.endswith(".pth")),
+                    key=os.path.getmtime)
+                for old in cks[:-args.keep_last_n]:
+                    os.remove(old)
+            print(f"checkpoint saved at step {step+1}", flush=True)
 
     os.makedirs(args.save_dir, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(args.save_dir, "dspark.pth"))

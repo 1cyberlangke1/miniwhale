@@ -209,9 +209,13 @@ class Model(nn.Module):
 
         输入：rate 更新步长。
         输出：无。
-        预期行为：遍历每层 ffn.gate，按 tokens_per_expert 调整 bias（参考实现 noaux_tc）。
+        预期行为：遍历主干每层 + DSpark 每 stage 的 ffn.gate，按 tokens_per_expert
+                  调整 bias（参考实现 noaux_tc）。
         """
-        for layer in self.layers:
+        modules = list(self.layers)
+        if self.dspark is not None:
+            modules += list(self.dspark.mtp)
+        for layer in modules:
             gate = getattr(layer.ffn, "gate", None)
             if gate is not None:
                 gate.update_bias(rate)
