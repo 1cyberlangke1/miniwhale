@@ -36,7 +36,16 @@ def maybe_compile(model: nn.Module, enabled: bool, mode: str = "default") -> nn.
     # 第二次启动直接命中，参考实现称 warm 编译可省 90%+ 时间（冷启动才是几分钟的元凶）。
     # 缓存 key 含输入 shape —— 训练 batch/seq 固定即可稳定命中。
     os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+    # AOTAutograd 层缓存（参考实现 Meta 实测占编译 13.5%）：缓存 autograd 图，
+    # 跨进程复用。参考实现文档：`TORCHINDUCTOR_AUTOGRAD_CACHE` 需 `FX_GRAPH_CACHE` 才生效。
+    os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
     os.environ.setdefault("TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE", "1")
+    # autotune 靠**实际运行** kernel 测配置——L 越大每次测越慢，编译时间随 L 线性增长
+    # （实测 L=320 编 21s、L=512 >55s）。参考实现默认 warmup=25/rep=100 次，对固定 shape
+    # 是浪费；降到 5/10 让 autotune 时间降 ~5×。训练 shape 固定，少量 reps 足够挑出
+    # 近优配置（autotune 结果落盘缓存，后续启动直接命中）。
+    os.environ.setdefault("TORCHINDUCTOR_DEFAULT_AUTOTUNE_WARMUP", "5")
+    os.environ.setdefault("TORCHINDUCTOR_DEFAULT_AUTOTUNE_REP", "10")
     import torch._inductor.config as _ind
     _ind.emulate_precision_casts = True
     # 小 batch 下模型是 launch-bound（实测 2.8 万 kernel/步，GPU 利用率 13%）。

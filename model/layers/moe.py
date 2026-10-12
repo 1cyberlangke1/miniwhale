@@ -167,16 +167,18 @@ class Gate(nn.Module):
             aux_loss = self.aux_loss_alpha * (f_i * P_i).sum()
         if self.training:
             with torch.no_grad():  # 累计每专家被选次数（供 update_bias）
+                # 用 scatter_add_（输出形状恒为 [n_routed]，静态）替代 torch.bincount
+                # （输出长度依赖数据 = dynamic shape operator → dynamo graph break）。
+                # 计数只供 update_bias（非梯度），数值等价：每个被选 (token,slot) 计数 +1。
+                idx_flat = indices.reshape(-1)
+                ones = torch.ones_like(idx_flat, dtype=torch.float32)
                 if image_mask is not None:
                     # 图像/文本 token 分别计数（参考实现 §2.1.1：两套 bias 各自独立更新）
-                    img = image_mask.bool()
-                    self.tokens_per_expert += torch.bincount(
-                        indices[~img].flatten(), minlength=self.n_routed).float()
-                    self.tokens_per_expert_vl += torch.bincount(
-                        indices[img].flatten(), minlength=self.n_routed).float()
+                    img_flat = image_mask.bool().unsqueeze(-1).expand_as(indices).reshape(-1)
+                    self.tokens_per_expert.scatter_add_(0, idx_flat, ones * (~img_flat))
+                    self.tokens_per_expert_vl.scatter_add_(0, idx_flat, ones * img_flat)
                 else:
-                    self.tokens_per_expert += torch.bincount(
-                        indices.flatten(), minlength=self.n_routed).float()
+                    self.tokens_per_expert.scatter_add_(0, idx_flat, ones)
         weights = scores.gather(1, indices)
         if self.norm_topk_prob and self.topk > 1:
             weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
@@ -208,6 +210,18 @@ class MoE(nn.Module):
             self.experts = nn.ModuleList([Expert(self.dim, inter, lim) for _ in range(self.n_routed)])
             self.shared_experts = nn.ModuleList([Expert(self.dim, inter, lim) for _ in range(self.n_shared)])
 
+    def _stacked_weights(self):
+        """把专家权重 stack 成 grouped GEMM 的 3D 权重 [E, N, K]。
+
+        输入：无（读 self.experts）。
+        输出：(w1 [E, inter, dim], w2 [E, dim, inter], w3 [E, inter, dim])。
+        预期行为：每步 stack 一次（E 很小），供 torch._grouped_mm 使用。
+        """
+        w1 = torch.stack([e.w1.weight for e in self.experts])
+        w2 = torch.stack([e.w2.weight for e in self.experts])
+        w3 = torch.stack([e.w3.weight for e in self.experts])
+        return w1, w2, w3
+
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         if self.dense:
             return self.dense_ffn(x)
@@ -215,22 +229,34 @@ class MoE(nn.Module):
         flat = x.reshape(-1, d)
         weights, indices, aux_loss = self.gate(flat, None if image_mask is None else image_mask.flatten())
 
-        # 累加器用 fp32（一致），最后转回输入 dtype。
-        # 全专家张量化：每个专家对**全部** token 算一遍，再按路由权重掩码累加。
-        # 未选中的 token 权重为 0，`w2(0·h)=0`，加 0 在 fp32 下精确 → 与参考实现逐专家累加逐位一致。
-        # 全静态形状、无 `Tensor.item()`、无数据依赖分支 → torch.compile 可完全融合（不再把
-        # Block.forward 切碎）。代价是专家 FLOPs ×n_experts，但模型是 launch-bound（GPU 13%），
-        # 少而大的 kernel 反而更快。
+        # 生产级稀疏 MoE：token 按专家排列 + grouped GEMM。每个 token 只算它选中的 top-k 个专家
+        # （保持稀疏，不把专家 FLOPs 乘 n_routed——全专家张量化是负优化）。argsort / scatter_add /
+        # cumsum 输出形状静态，不产生 graph break；grouped GEMM 由 inductor lowering。
+        n_tok, topk = indices.shape
+        flat_idx = indices.reshape(-1)                        # [n_tok*topk] 命中的专家 id
+        sort_order = torch.argsort(flat_idx, stable=True)     # 按专家排序（长度静态）
+        sorted_tok = sort_order // topk                       # 每个 (token,slot) 的 token 行号
+        sorted_w = weights.reshape(-1)[sort_order]            # 排序后的路由权重
+        counts = torch.zeros(self.n_routed, device=x.device, dtype=torch.int32)
+        counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.int32))
+        offs = counts.cumsum(0).to(torch.int32)               # 每专家累计 token 数（grouped_mm offsets）
+        perm_x = flat[sorted_tok]                             # [n_tok*topk, d] 按专家分组排列
+        w1, w2, w3 = self._stacked_weights()
+        # 与 Expert 语义对齐：w1/w3 的 bf16 matmul 结果上转 fp32 再做 SwiGLU（Expert 里 gate/up 均 .float()）
+        gate = torch._grouped_mm(perm_x, w1.transpose(-2, -1), offs=offs).float()
+        up = torch._grouped_mm(perm_x, w3.transpose(-2, -1), offs=offs).float()
+        if self.experts[0].swiglu_limit > 0:
+            lim = self.experts[0].swiglu_limit
+            up = torch.clamp(up, min=-lim, max=lim)
+            gate = torch.clamp(gate, max=lim)
+        h = F.silu(gate) * up
+        h = h * sorted_w.unsqueeze(-1)                        # 路由权重（fp32）
+        y = torch._grouped_mm(h.to(perm_x.dtype), w2.transpose(-2, -1), offs=offs)
         out = torch.zeros_like(flat, dtype=torch.float32)
-        for i, expert in enumerate(self.experts):
-            sel = indices == i                                   # [n_tok, topk]
-            w = torch.where(sel, weights, torch.zeros_like(weights)).sum(-1)  # [n_tok]
-            out += expert(flat, w[:, None].float())
-
+        out.index_add_(0, sorted_tok, y.float())             # 按 token 累加其 top-k 贡献
         for shared in self.shared_experts:
             out = out + shared(flat).float()
         out = out.view(b, L, d).to(x.dtype)
-        # 序列级平衡损失挂到输出（前向值不变，反向注入其梯度）——自动汇入主 loss 的反向图
         if aux_loss is not None:
             out = _AuxLossScaler.apply(out, aux_loss)
         return out

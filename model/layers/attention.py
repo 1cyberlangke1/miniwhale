@@ -246,12 +246,15 @@ class Attention(nn.Module):
         """
         b, L, H, D = q.shape
         T = kv.size(1)
+        K = idxs.size(-1)
         qf = q.float()
         kf = kv.float()
-        # gather KV: [B,L,K,D]
+        # gather KV: [B,L,K,D]。用沿 T 维的 gather（index 直接是 [B,L*K]），**不造**
+        # [B,L,T,D] 中间张量——后者在 L=1024/T=1152 时是 6 亿元素（fwd+bwd 爆显存）。
+        # gather 是纯复制无算术，与旧写法逐位一致。
         valid = idxs >= 0
         safe = idxs.clamp_min(0)
-        k_sel = kf.unsqueeze(1).expand(b, L, T, D).gather(2, safe.unsqueeze(-1).expand(-1, -1, -1, D))
+        k_sel = kf.gather(1, safe.reshape(b, L * K, 1).expand(b, L * K, D)).reshape(b, L, K, D)
         # QK^T：bf16 输入、fp32 累加（此处输入已是 bf16 上转的 fp32，等价 fp32 累加）
         scores = torch.einsum("blhd,blkd->blhk", qf, k_sel) * self.softmax_scale
         scores = scores.masked_fill(~valid.unsqueeze(2), -torch.inf)

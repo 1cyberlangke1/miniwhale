@@ -39,6 +39,10 @@ class TextConfig:
     rms_norm_eps: float = 1e-20
     initializer_range: float = 0.02
     max_position_embeddings: int = 32768
+    # KV/index 缓存的 batch 上限：__init__ 里按此预分配 buffer，避免 forward 中
+    # `_ensure_cache` 重建 buffer（改 _buffers）→ dynamo guard 失败 → 反复重编译。
+    # 训练 batch 固定，一开始就够大 → 全程不再重建。
+    max_batch_size: int = 16
     rope_theta: float = 10000.0
     # HF 标准字段（参考实现 HF config 同款）
     model_type: str = "miniwhale_text"
