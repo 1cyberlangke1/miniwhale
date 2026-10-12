@@ -281,19 +281,36 @@ def make_optimizers(model: nn.Module, lr: float = 1e-3, weight_decay: float = 0.
     engram_ids = {id(p) for n, p in model.named_parameters() if "engram" in n}
     sinkhorn_engram = [p for p in g["sinkhorn"] if id(p) in engram_ids]
     sinkhorn_other = [p for p in g["sinkhorn"] if id(p) not in engram_ids]
+    # lr_mult 记录每组相对「当前基准 lr」的倍数：调度器只更新基准 lr，按此倍数缩放，
+    # 否则 engram 的 ×5 会被每步 `g["lr"] = lr` 抹平（等于 Engram 没按参考实现配方训）。
     sinkhorn_groups = []
     if sinkhorn_other:
-        sinkhorn_groups.append({"params": sinkhorn_other, "lr": lr})
+        sinkhorn_groups.append({"params": sinkhorn_other, "lr": lr, "lr_mult": 1.0})
     if sinkhorn_engram:
-        sinkhorn_groups.append({"params": sinkhorn_engram, "lr": lr * engram_lr_mult})
+        sinkhorn_groups.append({"params": sinkhorn_engram, "lr": lr * engram_lr_mult,
+                                "lr_mult": engram_lr_mult})
 
     muon = Muon(
-        [{"params": g["muon"], "lr": lr, "weight_decay": weight_decay, "lr_scale": 0.18}],
+        [{"params": g["muon"], "lr": lr, "weight_decay": weight_decay, "lr_scale": 0.18,
+          "lr_mult": 1.0}],
         lr=lr, momentum=0.95, weight_decay=weight_decay, lr_scale=0.18,
         headwise=g["headwise"])
     adamw = torch.optim.AdamW(
-        [{"params": g["adamw_wd"], "lr": lr, "weight_decay": weight_decay},
-         {"params": g["adamw_nowd"], "lr": lr, "weight_decay": 0.0}],
+        [{"params": g["adamw_wd"], "lr": lr, "weight_decay": weight_decay, "lr_mult": 1.0},
+         {"params": g["adamw_nowd"], "lr": lr, "weight_decay": 0.0, "lr_mult": 1.0}],
         betas=(0.9, 0.95), eps=1e-20)
     sinkhorn = SinkhornBalanced(sinkhorn_groups, lr=lr)
     return muon, adamw, sinkhorn
+
+
+def set_base_lr(optimizers, lr: float):
+    """按当前基准 lr 更新各优化器参数组的 lr（保留每组的 lr_mult 倍数）。
+
+    输入：optimizers（Muon/AdamW/Sinkhorn 等）；lr 当前基准学习率。
+    输出：就地更新各组 `lr`。
+    预期行为：`g["lr"] = lr * g.get("lr_mult", 1.0)`——这样 Engram 组始终是基准的 ×5，
+              不被调度器抹平；无 lr_mult 键的组退化为 lr（向后兼容）。
+    """
+    for opt in optimizers:
+        for g in opt.param_groups:
+            g["lr"] = lr * g.get("lr_mult", 1.0)

@@ -26,7 +26,7 @@ from model.train.data import PretrainDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
-from model.train.optim import make_optimizers
+from model.train.optim import make_optimizers, set_base_lr
 from model.tokenizer import load_tokenizer
 
 
@@ -59,12 +59,11 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
     total_loss, steps = 0.0, 0
     t0 = time.time()
     for step, batch in enumerate(loader, start=start_step):
-        # 学习率调度：warmup + cosine（Muon 的 lr 由 head-wise 缩放，此处同步 base lr）
+        # 学习率调度：warmup + cosine（只更新基准 lr，各组按 lr_mult 缩放——
+        # 这样 Engram 的 ×5 学习率不会被抹平，参考实现 §4.2.2）
         lr = get_lr(step, args.total_steps, args.warmup_steps,
                     args.learning_rate, args.min_lr)
-        for opt in (muon, adamw, sinkhorn):
-            for g in opt.param_groups:
-                g["lr"] = lr
+        set_base_lr((muon, adamw, sinkhorn), lr)
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)
         # CUDA Graph（reduce-overhead）在训练里必须每步标记前向起点，否则上一步输出仍待

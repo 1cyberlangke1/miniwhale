@@ -168,15 +168,19 @@ class Indexer(nn.Module):
         return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
 
+# 主 loss 的反向缩放（供 indexer loss 用）。用**模块级全局**而非 autograd.Function 的类属性：
+# dynamo 访问 `Cls.attr` 会生成 GetAttrVariable(AutogradFunctionVariable())，其对 Optional/类
+# 属性做 python_type() 检查会 graph break（真实训练路径实测 14 个 break 全由此而来）。
+_MAIN_LOSS_SCALE = torch.zeros(())
+
+
 class IndexerLossAutoScaler(torch.autograd.Function):
     """把 indexer loss 挂到某个输出张量上，不改变前向值，只在反向注入它的梯度。
 
     参考实现做法（DSA indexer）：indexer 的 KL loss 不能直接 backward（会与主 loss 重复计入），
     而是通过本 Function 挂在 attention 输出上——前向透传，反向把 indexer_loss 的梯度按
-    `main_loss_backward_scale` 缩放后回传，从而用同一个 backward 同时驱动主 loss 和 indexer loss。
+    `_MAIN_LOSS_SCALE` 缩放后回传，从而用同一个 backward 同时驱动主 loss 和 indexer loss。
     """
-
-    main_loss_backward_scale: torch.Tensor | None = None
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, indexer_loss: torch.Tensor) -> torch.Tensor:
@@ -186,14 +190,11 @@ class IndexerLossAutoScaler(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         (indexer_loss,) = ctx.saved_tensors
-        loss_scale = IndexerLossAutoScaler.main_loss_backward_scale
-        if loss_scale is None:
-            loss_scale = torch.ones((), dtype=indexer_loss.dtype, device=indexer_loss.device)
-        else:
-            loss_scale = loss_scale.to(device=indexer_loss.device, dtype=indexer_loss.dtype)
+        loss_scale = _MAIN_LOSS_SCALE.to(device=indexer_loss.device, dtype=indexer_loss.dtype)
         return grad_output, torch.ones_like(indexer_loss) * loss_scale
 
     @staticmethod
     def set_loss_scale(scale: torch.Tensor) -> None:
         """设置反向时施加在 indexer loss 上的缩放（通常取主 loss 的 detach）。"""
-        IndexerLossAutoScaler.main_loss_backward_scale = scale.detach()
+        global _MAIN_LOSS_SCALE
+        _MAIN_LOSS_SCALE = scale.detach()
