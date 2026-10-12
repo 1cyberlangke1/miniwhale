@@ -58,17 +58,17 @@ class EngramTable(nn.Module):
         return quant.flatten(-2), scale.squeeze(-1)                     # [...,dim], [...,dim//bs]
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        rows = F.embedding(indices, self.weight)                         # [..., dim] fp32
-        if not self.training:
-            # 推理：master 已是最终（反量化后的）权重，直接查表——与参考实现查表反量化等价。
-            # 若此处再量化一次会造成「双重量化」的额外舍入（QAT 只在训练时模拟）。
-            return rows.to(torch.bfloat16)
-        quant, scale = self._quantize_rows(rows.detach())
-        # 反量化（按参考实现查表）：每 block 乘自己的 scale
-        deq = (quant.float().unflatten(-1, (-1, self.block_size))
-               * scale.float().unsqueeze(-1)).flatten(-2)
-        # 直通梯度：前向用反量化值，反向把梯度回传 master 权重
-        return (deq + (rows - rows.detach())).to(torch.bfloat16)
+        """查表（训练/推理**同一条**路径）。
+
+        输入：indices [...]。
+        输出：[..., dim] bf16。
+        预期行为：master 权重（fp32）直接查表转 bf16。参考实现推理存 fp8、查表时反量化；
+                  猫猫 master 存反量化后的 fp32，查表即等价（无额外量化）。
+                  **不在训练时做 QAT**：技术报告的 QAT 只用于 indexer 与主 KV cache，
+                  Engram 表是「存 fp8、查表反量化」的推理格式，不是训练机制。
+                  若训练时再量化一次会造成训练/eval 数值分叉（训练路径从未被对拍验证）。
+        """
+        return F.embedding(indices, self.weight).to(torch.bfloat16)
 
 
 class Engram(nn.Module):
