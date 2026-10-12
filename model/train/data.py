@@ -41,30 +41,46 @@ class PretrainDataset(IterableDataset):
         # 行数：datasets 对本地 jsonl 已统计，流式/非流式都在 info.splits 里给，直接用。
         # 极小的临时文件 datasets 可能不给 splits（None）——回退 0，调用方按 0 处理。
         splits = getattr(self.samples.info, "splits", None)
-        self.num_rows = splits["train"].num_examples if splits and "train" in splits else 0
+        n_docs = splits["train"].num_examples if splits and "train" in splits else 0
+        # 打包后的**片段数**（而非文档数）：采样若干文档估平均 token 数，估算总片段数。
+        # 用于 lr 调度总步数；估偏一点无妨（调度只是曲线形状），但必须量级正确。
+        self.num_rows = self._estimate_packed_chunks(n_docs) if n_docs else 0
 
-    def _encode(self, text: str):
-        tokens = self.tokenizer(str(text), add_special_tokens=False,
-                                max_length=self.max_length - 2, truncation=True).input_ids
-        tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
-        pad = self.tokenizer.pad_token_id
-        input_ids = tokens + [pad] * (self.max_length - len(tokens))
-        labels = list(input_ids)
-        for i, v in enumerate(labels):
-            if v == pad:
-                labels[i] = -100
-        return {"input_ids": torch.tensor(input_ids), "labels": torch.tensor(labels)}
+    def _estimate_packed_chunks(self, n_docs: int, sample: int = 512) -> int:
+        """采样估总 token，除以 max_length 得片段数。"""
+        tot, n = 0, 0
+        for row in self.samples.take(sample) if self.streaming else self.samples.select(range(min(sample, n_docs))):
+            ids = self.tokenizer(str(row["text"]), add_special_tokens=False,
+                                 max_length=self.max_length, truncation=True).input_ids
+            tot += len(ids) + 2  # +bos +eos
+            n += 1
+        avg = tot / max(n, 1)
+        return int(n_docs * avg / self.max_length)
+
+    def _stream(self):
+        """按配置返回文档流（流式打乱 / 顺序）。"""
+        if self.streaming:
+            return self.samples.shuffle(buffer_size=self.shuffle, seed=self.seed) \
+                if self.shuffle else self.samples
+        return (self.samples[i] for i in torch.randperm(len(self.samples)).tolist())
 
     def __iter__(self):
-        if self.streaming:
-            ds = self.samples.shuffle(buffer_size=self.shuffle, seed=self.seed) \
-                if self.shuffle else self.samples
-            for row in ds:
-                yield self._encode(row["text"])
-        else:
-            order = torch.randperm(len(self.samples)).tolist()
-            for i in order:
-                yield self._encode(self.samples[i]["text"])
+        # **序列打包**：把文档首尾相连成一条 token 流，再切成定长片段——零 padding。
+        # 否则短文档（本语料平均 ~160 token）右侧 pad 到 max_length 会浪费 ~80% 的
+        # GPU 算力（算在 pad 上）。打包是标准预训练做法，让 GPU 只算真实 token。
+        buf: list[int] = []
+        bos, eos = self.tokenizer.bos_token_id, self.tokenizer.eos_token_id
+        for row in self._stream():
+            ids = self.tokenizer(str(row["text"]), add_special_tokens=False,
+                                 max_length=self.max_length, truncation=True).input_ids
+            buf.append(bos)
+            buf.extend(ids)
+            buf.append(eos)
+            while len(buf) >= self.max_length:
+                chunk = buf[:self.max_length]
+                del buf[:self.max_length]
+                t = torch.tensor(chunk, dtype=torch.long)
+                yield {"input_ids": t, "labels": t.clone()}
 
     def __len__(self):
         return self.num_rows

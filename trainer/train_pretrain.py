@@ -59,6 +59,7 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
     total_loss, steps = 0.0, 0
     t0 = time.time()
     for step, batch in enumerate(loader, start=start_step):
+        t_step0 = time.time()
         # 学习率调度：warmup + cosine（只更新基准 lr，各组按 lr_mult 缩放——
         # 这样 Engram 的 ×5 学习率不会被抹平，参考实现 §4.2.2）
         lr = get_lr(step, args.total_steps, args.warmup_steps,
@@ -80,6 +81,10 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
         # indexer loss 的梯度按主 loss scale 缩放（参考实现 DSA 做法）
         IndexerLossAutoScaler.set_loss_scale(loss.detach())
         loss.backward()
+        # 首步含 torch.compile 冷编译 + autotune（前向+反向），单独计时打印，避免黑盒等待
+        if step == start_step:
+            torch.cuda.synchronize()
+            print(f"[首次前向+反向 含编译] {(time.time() - t_step0):.1f}s", flush=True)
         if (step + 1) % args.accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             muon.step(); adamw.step(); sinkhorn.step()
@@ -89,9 +94,12 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
         if step % args.log_interval == 0:
+            # 打印**瞬时**每步耗时（不是累计均值），才能看清稳态速度
+            now = time.time()
             print(f"epoch {epoch} step {step} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
-                  f"{(time.time()-t0)/max(steps,1)*1000:.0f}ms/step", flush=True)
+                  f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
+            t_step0 = now
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
         if args.save_interval and (step + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)

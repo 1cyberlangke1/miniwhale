@@ -40,19 +40,10 @@ def maybe_compile(model: nn.Module, enabled: bool, mode: str = "default") -> nn.
     # 跨进程复用。参考实现文档：`TORCHINDUCTOR_AUTOGRAD_CACHE` 需 `FX_GRAPH_CACHE` 才生效。
     os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
     os.environ.setdefault("TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE", "1")
-    # autotune 靠**实际运行** kernel 测配置——L 越大每次测越慢，编译时间随 L 线性增长
-    # （实测 L=320 编 21s、L=512 >55s）。参考实现默认 warmup=25/rep=100 次，对固定 shape
-    # 是浪费；降到 5/10 让 autotune 时间降 ~5×。训练 shape 固定，少量 reps 足够挑出
-    # 近优配置（autotune 结果落盘缓存，后续启动直接命中）。
-    os.environ.setdefault("TORCHINDUCTOR_DEFAULT_AUTOTUNE_WARMUP", "5")
-    os.environ.setdefault("TORCHINDUCTOR_DEFAULT_AUTOTUNE_REP", "10")
     import torch._inductor.config as _ind
+    # 让 inductor 复现 eager 的低精度语义（bf16/fp16 上转 fp32 算完再下转），
+    # 否则 inductor 省略中间下转、数值更接近 fp64，与参考实现逐位对拍不一致。仅此一项。
     _ind.emulate_precision_casts = True
-    # 小 batch 下模型是 launch-bound（实测 2.8 万 kernel/步，GPU 利用率 13%）。
-    # inductor 默认把 reduction 拆成多个小 kernel，进一步放大 launch 开销。
-    # 关掉拆分让 reduction 合成单 kernel（PyTorch issue #179697 的推荐修复），
-    # 只改 kernel 划分、不改数值。
-    _ind.split_reductions = False
     # CUDA Graph（mode="reduce-overhead"）只对**静态 shape** 的图有意义。
     # MoE 前向用 `torch.where(indices == i)` 取各专家命中的 token（参考实现写法），
     # 每步命中数不同 → 动态 shape → 强行录图会**每步录一张新图**（警告
@@ -61,14 +52,9 @@ def maybe_compile(model: nn.Module, enabled: bool, mode: str = "default") -> nn.
     # 仍走 CUDA Graph 提速。**只改执行调度，不改任何算子数值。**
     if mode == "reduce-overhead":
         _ind.triton.cudagraph_skip_dynamic_graphs = True
-    # 8 层 attention 结构不同（压缩比 / 是否 KV 源 / 是否 index 源 / 是否用候选块），
-    # 但 Block.forward 是同一个 code object，dynamo 按 code object 缓存 —— **5 种结构
-    # 只编译 5 次**（自动去重），比 isolate_recompiles（每层各编一次 = 8 次）更省编译时间。
-    # 放宽单函数重编译上限，防止第 9 个变体回退 eager 后每步重试（掉速）。
-    torch._dynamo.config.recompile_limit = 64
-    torch._dynamo.config.accumulated_recompile_limit = 256
-    # 逐层 compile：每层独立成图（含 CUDA Graph）；只替换 forward（不包成 OptimizedModule），
-    # 以免 state_dict 键被加 `_orig_mod.` 前缀。
+    # 逐层 compile：每层独立成图；只替换 forward（不包成 OptimizedModule），
+    # 以免 state_dict 键被加 `_orig_mod.` 前缀。Block.forward 是同一个 code object，
+    # dynamo 按 code object 缓存，结构相同的层自动复用同一张编译产物。
     for layer in model.layers:
         layer.forward = torch.compile(layer.forward, mode=mode)
     return model
