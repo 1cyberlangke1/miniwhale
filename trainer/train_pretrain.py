@@ -60,18 +60,23 @@ def get_lr(step, total_steps, warmup_steps, base_lr, min_lr,
     return min_lr + (base_lr - min_lr) * cos
 
 
-def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0):
-    """跑一个 epoch。
+def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
+                max_steps=None):
+    """跑一个 epoch（或按步数模式跑到 max_steps）。
 
-    输入：epoch；loader；model；三个优化器（Muon/AdamW/Sinkhorn）；args；start_step（续训）。
-    输出：本 epoch 的平均 loss。
+    输入：epoch；loader；model；三个优化器（Muon/AdamW/Sinkhorn）；args；start_step（续训）；
+          max_steps（按步数模式的上限；None=跑满整个 loader）。
+    输出：本次的平均 loss。
     预期行为：bf16 autocast 前向；交叉熵只算非 -100 位置；梯度累积 + 裁剪；
-              每步按 warmup+cosine 更新三个优化器的 lr。
+              每步按 warmup+cosine 更新三个优化器的 lr。max_steps=0 时一步都不跑。
     """
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
     for step, batch in enumerate(loader, start=start_step):
+        # 按步数模式：到量即停（max_steps=0 → 0 步，字面语义，不是哨兵）
+        if max_steps is not None and step - start_step >= max_steps:
+            break
         t_step0 = time.time()
         # 学习率调度：warmup + cosine（只更新基准 lr，各组按 lr_mult 缩放——
         # 这样 Engram 的 ×5 学习率不会被抹平，参考实现 §4.2.2）
@@ -124,8 +129,6 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
                 for old in cks[:-args.keep_last_n]:
                     os.remove(old)
             print(f"checkpoint saved at step {step+1}", flush=True)
-        if args.steps and step + 1 >= args.steps:
-            break
     return total_loss / max(steps, 1)
 
 
@@ -133,8 +136,9 @@ def main():
     parser = argparse.ArgumentParser(description="miniwhale 预训练")
     parser.add_argument("--data_path", type=str, default="dataset/pretrain_t2t_mini.jsonl")
     parser.add_argument("--save_dir", type=str, default="out")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=0, help="最多训练步数（0=跑满 epoch）")
+    parser.add_argument("--epochs", type=int, default=1, help="训练轮数（默认 1）")
+    parser.add_argument("--steps", type=int, default=0,
+                        help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=2.6e-4,
                         help="峰值 lr（按参考实现报告 §4.2.2：2.6e-4）")
@@ -150,7 +154,7 @@ def main():
     # 单 jsonl = 1 个 shard；`datasets` 的分片规则是 worker 数 ≤ shard 数，
     # 故 >1 会被库自动压回 1（并打 warning）。默认 1 = 实际行为，不误导。
     parser.add_argument("--num_workers", type=int, default=1)
-    parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--log_interval", type=int, default=200)
     parser.add_argument("--save_interval", type=int, default=1000,
                         help="每多少步存一次 checkpoint（0=不存）")
     parser.add_argument("--keep_last_n", type=int, default=3,
@@ -178,9 +182,19 @@ def main():
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    # 余弦调度总步数：未显式指定则按数据集行数 // batch × epochs
+    # 训练模式：默认 steps=0、epochs=1。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    if args.steps and args.epochs:
+        print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
+              f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
+        epochs_to_run, max_steps = args.epochs, None
+    elif args.steps:
+        epochs_to_run, max_steps = 1, args.steps   # 按步数：跑 args.steps 步
+    else:
+        epochs_to_run, max_steps = args.epochs, None  # 按轮次
+    # 余弦调度总步数：按步数模式取 max_steps；按轮次模式按数据集行数 // batch × 轮数
     if not args.total_steps:
-        args.total_steps = max(ds.num_rows // args.batch_size, 1) * args.epochs
+        args.total_steps = (max_steps if max_steps
+                            else max(ds.num_rows // args.batch_size, 1) * epochs_to_run)
     print(f"数据集 {ds.num_rows} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
     # 数据集是 IterableDataset（流式），自带缓冲打乱，DataLoader 不能再传 shuffle=True
@@ -199,9 +213,9 @@ def main():
         m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
         start_step = int(m.group(1)) if m else 0
         print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
-    for epoch in range(args.epochs):
+    for epoch in range(epochs_to_run):
         loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
-                           start_step=start_step)
+                           start_step=start_step, max_steps=max_steps)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")
         torch.save(model.state_dict(), os.path.join(args.save_dir, f"pretrain_e{epoch}.pth"))
 

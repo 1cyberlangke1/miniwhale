@@ -67,18 +67,21 @@ def collate_fn(batch):
     }
 
 
-def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0):
+def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
+                max_steps=None):
     """跑一个 epoch（SigLIP 对比）。
 
-    输入：epoch；loader；model（SigLIP 双塔）；三个优化器；args；start_step。
+    输入：epoch；loader；model（SigLIP 双塔）；三个优化器；args；start_step；max_steps（步数上限，None=跑满）。
     输出：本 epoch 平均 loss。
     预期行为：bf16 autocast 前向；pairwise sigmoid loss；梯度累积 + 裁剪；
-              每步按 warmup+cosine 更新三个优化器的 lr。
+              每步按 warmup+cosine 更新三个优化器的 lr。max_steps=0 时一步都不跑。
     """
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
     for step, batch in enumerate(loader, start=start_step):
+        if max_steps is not None and step - start_step >= max_steps:
+            break
         # 对比损失需要 batch 内至少 2 个样本（1×1 的 logits 退化）
         if batch is None or batch["text_ids"].size(0) < 2:
             continue
@@ -106,16 +109,15 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
             torch.save(model.image.vit.state_dict(),
                        os.path.join(args.save_dir, f"vit_siglip_s{step+1}.pth"))
             print(f"checkpoint saved at step {step+1}", flush=True)
-        if args.steps and step + 1 >= args.steps:
-            break
     return total_loss / max(steps, 1)
 
 
 def main():
     ap = argparse.ArgumentParser(description="miniwhale ViT SigLIP 对比预训练")
-    ap.add_argument("--data_path", default="dataset/sft_i2t.parquet")
-    ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--steps", type=int, default=1000, help="最多训练步数（0=跑满 epoch）")
+    ap.add_argument("--data_path", default="dataset/sft_i2t_mini.parquet")
+    ap.add_argument("--epochs", type=int, default=1, help="训练轮数（默认 1）")
+    ap.add_argument("--steps", type=int, default=0,
+                    help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--caption_len", type=int, default=64, help="caption 最大 token 数")
     ap.add_argument("--learning_rate", type=float, default=1e-4)
@@ -130,7 +132,7 @@ def main():
     ap.add_argument("--text_layers", type=int, default=4, help="文本塔层数")
     ap.add_argument("--text_heads", type=int, default=4, help="文本塔注意力头数")
     ap.add_argument("--num_workers", type=int, default=0)
-    ap.add_argument("--log_interval", type=int, default=50)
+    ap.add_argument("--log_interval", type=int, default=200)
     ap.add_argument("--save_interval", type=int, default=1000,
                     help="每多少步存一次 checkpoint（0=不存）")
     ap.add_argument("--save_dir", default="out")
@@ -153,8 +155,18 @@ def main():
 
     ds = ImageTextPairDataset(args.data_path, tokenizer, max_length=args.caption_len,
                               vision_cfg=cfg.vision)
+    # 训练模式：默认 steps=0、epochs=1。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    if args.steps and args.epochs:
+        print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
+              f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
+        epochs_to_run, max_steps = args.epochs, None
+    elif args.steps:
+        epochs_to_run, max_steps = 1, args.steps
+    else:
+        epochs_to_run, max_steps = args.epochs, None
     if not args.total_steps:
-        args.total_steps = max(len(ds) // args.batch_size, 1) * args.epochs
+        args.total_steps = (max_steps if max_steps
+                            else max(len(ds) // args.batch_size, 1) * epochs_to_run)
     print(f"数据集 {len(ds)} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
@@ -162,8 +174,9 @@ def main():
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
     os.makedirs(args.save_dir, exist_ok=True)
-    for epoch in range(args.epochs):
-        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args)
+    for epoch in range(epochs_to_run):
+        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
+                           max_steps=max_steps)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")
 
     # 只留视觉编码器（参考实现：丢弃 LLM，保留优化后的 ViT）

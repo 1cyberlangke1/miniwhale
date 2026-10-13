@@ -75,7 +75,9 @@ def main():
     ap = argparse.ArgumentParser(description="miniwhale DSpark 训练")
     ap.add_argument("--data_path", default="dataset/pretrain_t2t_mini.jsonl")
     ap.add_argument("--ckpt", default=None, help="已训练的 backbone 权重（可选）")
-    ap.add_argument("--steps", type=int, default=1000)
+    ap.add_argument("--epochs", type=int, default=1, help="训练轮数（默认 1）")
+    ap.add_argument("--steps", type=int, default=0,
+                    help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--lr", type=float, default=6e-4, help="参考实现 lr=6e-4")
@@ -83,7 +85,7 @@ def main():
     ap.add_argument("--warmup_steps", type=int, default=100, help="线性预热步数")
     ap.add_argument("--router_bias_rate", type=float, default=1e-3,
                     help="noaux_tc 纠正 bias 的更新步长（非梯度）")
-    ap.add_argument("--log_interval", type=int, default=50)
+    ap.add_argument("--log_interval", type=int, default=200)
     ap.add_argument("--save_interval", type=int, default=1000,
                     help="每多少步存一次 checkpoint（0=不存）")
     ap.add_argument("--keep_last_n", type=int, default=3,
@@ -113,10 +115,20 @@ def main():
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95))
     model.train()
 
+    # 训练模式：默认 steps=0、epochs=1。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    if args.steps and args.epochs:
+        print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
+              f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
+        total_steps = max(len(ds) // args.batch, 1) * args.epochs
+    elif args.steps:
+        total_steps = args.steps
+    else:
+        total_steps = max(len(ds) // args.batch, 1) * args.epochs
+
     tc = cfg.text
     it = iter(loader)
-    for step in range(args.steps):
-        lr = get_lr(step, args.steps, args.warmup_steps, args.lr, args.min_lr)
+    for step in range(total_steps):
+        lr = get_lr(step, total_steps, args.warmup_steps, args.lr, args.min_lr)
         for g in opt.param_groups:
             g["lr"] = lr
         try:
@@ -146,7 +158,7 @@ def main():
         # noaux_tc 纠正 bias 按负载均衡规则更新（非梯度；主干 MoE 冻结但仍需均衡）
         model.update_router_bias(args.router_bias_rate)
         if step % args.log_interval == 0:
-            print(f"dspark step {step}/{args.steps} loss {loss.item():.4f} "
+            print(f"dspark step {step}/{total_steps} loss {loss.item():.4f} "
                   f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
         if args.save_interval and (step + 1) % args.save_interval == 0:

@@ -48,18 +48,21 @@ def get_lr(step, total_steps, warmup_steps, base_lr, min_lr):
     return min_lr + (base_lr - min_lr) * cos
 
 
-def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0):
-    """跑一个 epoch。
+def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
+                max_steps=None):
+    """跑一个 epoch（或按步数模式跑到 max_steps）。
 
-    输入：epoch；loader；model；三个优化器（Muon/AdamW/Sinkhorn）；args；start_step（续训）。
+    输入：epoch；loader；model；三个优化器；args；start_step（续训）；max_steps（步数上限，None=跑满）。
     输出：本 epoch 的平均 loss。
     预期行为：bf16 autocast 前向；交叉熵只算 assistant 段（非 -100）；梯度累积 + 裁剪；
-              每步按 warmup+cosine 更新三个优化器的 lr。
+              每步按 warmup+cosine 更新三个优化器的 lr。max_steps=0 时一步都不跑。
     """
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
     for step, batch in enumerate(loader, start=start_step):
+        if max_steps is not None and step - start_step >= max_steps:
+            break
         # 只更新基准 lr，各组按 lr_mult 缩放（保留 Engram ×5，参考实现 §4.2.2）
         lr = get_lr(step, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
         set_base_lr((muon, adamw, sinkhorn), lr)
@@ -116,8 +119,6 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
                 for old in cks[:-args.keep_last_n]:
                     os.remove(old)
             print(f"checkpoint saved at step {step+1}", flush=True)
-        if args.steps and step + 1 >= args.steps:
-            break
     return total_loss / max(steps, 1)
 
 
@@ -126,8 +127,9 @@ def main():
     parser.add_argument("--data_path", type=str, default="dataset/sft_t2t_mini.jsonl")
     parser.add_argument("--ckpt", type=str, default=None, help="预训练权重（可选）")
     parser.add_argument("--save_dir", type=str, default="out")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--steps", type=int, default=0, help="最多训练步数（0=跑满 epoch）")
+    parser.add_argument("--epochs", type=int, default=1, help="训练轮数（默认 1）")
+    parser.add_argument("--steps", type=int, default=0,
+                        help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--min_lr", type=float, default=1e-6, help="余弦衰减的最低 lr")
@@ -141,7 +143,7 @@ def main():
     # 单 jsonl = 1 个 shard；`datasets` 的分片规则是 worker 数 ≤ shard 数，
     # 故 >1 会被库自动压回 1（并打 warning）。默认 1 = 实际行为，不误导。
     parser.add_argument("--num_workers", type=int, default=1)
-    parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--log_interval", type=int, default=200)
     parser.add_argument("--save_interval", type=int, default=1000,
                         help="每多少步存一次 checkpoint（0=不存）")
     parser.add_argument("--keep_last_n", type=int, default=3,
@@ -170,9 +172,19 @@ def main():
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 训练模式：默认 steps=0、epochs=1。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    if args.steps and args.epochs:
+        print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
+              f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
+        epochs_to_run, max_steps = args.epochs, None
+    elif args.steps:
+        epochs_to_run, max_steps = 1, args.steps
+    else:
+        epochs_to_run, max_steps = args.epochs, None
     # 数据集是 IterableDataset（流式），自带缓冲打乱，DataLoader 不能再传 shuffle=True
     if not args.total_steps:
-        args.total_steps = max(ds.num_rows // args.batch_size, 1) * args.epochs
+        args.total_steps = (max_steps if max_steps
+                            else max(ds.num_rows // args.batch_size, 1) * epochs_to_run)
     print(f"数据集 {ds.num_rows} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
     loader = DataLoader(ds, batch_size=args.batch_size,
@@ -180,8 +192,9 @@ def main():
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
     os.makedirs(args.save_dir, exist_ok=True)
-    for epoch in range(args.epochs):
-        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args)
+    for epoch in range(epochs_to_run):
+        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
+                           max_steps=max_steps)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")
     torch.save(model.state_dict(), os.path.join(args.save_dir, "sft.pth"))
     print("SFT 完成，已保存 sft.pth")

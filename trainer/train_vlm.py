@@ -64,18 +64,21 @@ def collate_fn(batch):
             "token_types": token_types, "images": images}
 
 
-def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0):
+def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
+                max_steps=None):
     """跑一个 epoch（图像注入 + 文本交叉熵）。
 
-    输入：epoch；loader；model（含 ViT/Aligner）；三个主干优化器；args；start_step。
+    输入：epoch；loader；model（含 ViT/Aligner）；三个主干优化器；args；start_step；max_steps（步数上限，None=跑满）。
     输出：本 epoch 平均 loss。
     预期行为：每步把图像 span 注入主干，反向传播更新 ViT/Aligner/主干；
-              每步按 warmup+cosine 更新三个优化器的 lr。
+              每步按 warmup+cosine 更新三个优化器的 lr。max_steps=0 时一步都不跑。
     """
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
     for step, batch in enumerate(loader, start=start_step):
+        if max_steps is not None and step - start_step >= max_steps:
+            break
         # 只更新基准 lr，各组按 lr_mult 缩放（保留 Engram ×5，参考实现 §4.2.2）
         lr = get_lr(step, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
         set_base_lr((muon, adamw, sinkhorn), lr)
@@ -116,19 +119,18 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
                 for old in cks[:-args.keep_last_n]:
                     os.remove(old)
             print(f"checkpoint saved at step {step+1}", flush=True)
-        if args.steps and step + 1 >= args.steps:
-            break
     return total_loss / max(steps, 1)
 
 
 def main():
     ap = argparse.ArgumentParser(description="miniwhale 多模态训练")
-    ap.add_argument("--data_path", default="dataset/sft_i2t.parquet")
+    ap.add_argument("--data_path", default="dataset/sft_i2t_mini.parquet")
     ap.add_argument("--ckpt", default=None, help="已训练的主干权重（可选）")
     ap.add_argument("--vit_ckpt", default=None,
                     help="第一阶段（SigLIP 对比）产出的视觉编码器权重（可选；按参考实现两阶段）")
-    ap.add_argument("--epochs", type=int, default=1)
-    ap.add_argument("--steps", type=int, default=1000, help="最多训练步数（0=跑满 epoch）")
+    ap.add_argument("--epochs", type=int, default=1, help="训练轮数（默认 1）")
+    ap.add_argument("--steps", type=int, default=0,
+                    help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
     ap.add_argument("--seq_len", type=int, default=512)
     ap.add_argument("--batch_size", type=int, default=2)
     ap.add_argument("--learning_rate", type=float, default=1e-4)
@@ -140,7 +142,7 @@ def main():
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--router_bias_rate", type=float, default=1e-3)
     ap.add_argument("--num_workers", type=int, default=0)
-    ap.add_argument("--log_interval", type=int, default=50)
+    ap.add_argument("--log_interval", type=int, default=200)
     ap.add_argument("--save_interval", type=int, default=1000,
                     help="每多少步存一次 checkpoint（0=不存）")
     ap.add_argument("--keep_last_n", type=int, default=3,
@@ -170,8 +172,18 @@ def main():
 
     ds = MultimodalDataset(args.data_path, tokenizer, max_length=args.seq_len,
                            image_token_id=cfg.text.image_token_id, vision_cfg=cfg.vision)
+    # 训练模式：默认 steps=0、epochs=1。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    if args.steps and args.epochs:
+        print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
+              f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
+        epochs_to_run, max_steps = args.epochs, None
+    elif args.steps:
+        epochs_to_run, max_steps = 1, args.steps
+    else:
+        epochs_to_run, max_steps = args.epochs, None
     if not args.total_steps:
-        args.total_steps = max(len(ds) // args.batch_size, 1) * args.epochs
+        args.total_steps = (max_steps if max_steps
+                            else max(len(ds) // args.batch_size, 1) * epochs_to_run)
     print(f"数据集 {len(ds)} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
@@ -181,12 +193,15 @@ def main():
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
 
     os.makedirs(args.save_dir, exist_ok=True)
-    for epoch in range(args.epochs):
-        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args)
+    for epoch in range(epochs_to_run):
+        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
+                           max_steps=max_steps)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")
 
     torch.save(model.state_dict(), os.path.join(args.save_dir, "vlm.pth"))
-    print("多模态训练完成，已保存 vlm.pth")
+    # ViT 自回归微调阶段（报告 §4.2.2 阶段二）：只保留优化后的视觉编码器，丢弃 LLM
+    torch.save(model.vision.state_dict(), os.path.join(args.save_dir, "vit_ar.pth"))
+    print("多模态训练完成，已保存 vlm.pth + vit_ar.pth（仅视觉编码器）")
 
 
 if __name__ == "__main__":

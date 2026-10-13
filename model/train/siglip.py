@@ -131,12 +131,15 @@ class SigLIP(nn.Module):
 
     @staticmethod
     def loss(logits: torch.Tensor) -> torch.Tensor:
-        """pairwise sigmoid loss。
+        """pairwise sigmoid loss（按参考实现 big_vision siglip.py 训练路径）。
 
         输入：logits [B, B]（图 i · 文 j，已含温度与偏置）。
         输出：标量。
-        预期行为：对角（i==j）为 +1 正样本，其余 -1 负样本；-logsigmoid(sign×logits) 求均值。
+        预期行为：对角（i==j）为 +1 正样本，其余 -1 负样本；先对每行求 nll 之和，
+                  **再对 batch 求平均**（= 除以 B，不是除以 B²）——一致。
+                  参考实现源码：nll = -sum(log_sigmoid(m1_diag1 * logits), axis=-1); loss = mean(nll)。
         """
         b = logits.size(0)
         sign = 2 * torch.eye(b, device=logits.device) - 1
-        return -F.logsigmoid(sign * logits).mean()
+        nll = -F.logsigmoid(sign * logits).sum(dim=-1)   # 每行 nll 之和
+        return nll.mean()                                 # 对 batch 求平均（÷B）
