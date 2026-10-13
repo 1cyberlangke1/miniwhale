@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 
 class PretrainDataset(IterableDataset):
@@ -425,3 +425,63 @@ class ImageTextPairDataset(IterableDataset):
         return {"patches": patches, "grid": (n_vit_h, n_vit_w),
                 "text_ids": torch.tensor(text_ids[:self.max_length]),
                 "text_mask": torch.tensor(text_mask[:self.max_length], dtype=torch.bool)}
+
+
+class PreprocessedPairDataset(IterableDataset):
+    """图文对数据集（读**离线预处理**张量，零现场解码）——SigLIP 对比预训练用。
+
+    输入：预处理目录（含 patches.npy / captions.npy / caption_mask.npy / meta.json）；
+          shuffle（True=每 epoch 打乱图序，默认）。
+    输出（迭代）：{"patches": [n,3,p,p](bf16), "grid": (n_h,n_w), "text_ids": [L], "text_mask": [L]}。
+    预期行为：patches 以 uint16 位模式存 memmap，`.view(torch.bfloat16)` 零拷贝还原；
+              每张图（=一行）随机取一条 caption 当正样本（同图多描述会互成假负例，
+              故每行只出一个样本，多 caption 通过多 epoch 轮换覆盖）。
+              num_workers>0 时各 worker 按下标取模切分，互不重叠。
+    """
+
+    def __init__(self, pre_dir: str | Path, shuffle: bool = True, seed: int = 42):
+        import json
+
+        self.dir = str(pre_dir)
+        meta = json.loads(Path(self.dir, "meta.json").read_text(encoding="utf-8"))
+        self.total = meta["total"]
+        self.grid = (meta["grid"], meta["grid"])
+        self.num_captions = meta["num_captions"]
+        self.caption_len = meta["caption_len"]
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        # **只存路径**，不在此打开 memmap：DataLoader 用 spawn 起 worker 要 pickle 整个
+        # dataset，np.memmap 不可 pickle（会 OSError: Invalid argument）。memmap 在
+        # __iter__ 里由**每个 worker 自己**惰性打开。
+
+    def __len__(self):
+        return self.total
+
+    def set_epoch(self, epoch: int):
+        """每 epoch 前调用：换随机种子，图序与 caption 选择都随之变化。"""
+        self.epoch = epoch
+
+    def __iter__(self):
+        import random
+
+        import numpy as np
+
+        # 每个 worker 各自打开 memmap（不跨进程 pickle）；只在访问时读该行，不占常驻内存。
+        patches = np.load(Path(self.dir, "patches.npy"), mmap_mode="r")
+        caps = np.load(Path(self.dir, "captions.npy"), mmap_mode="r")
+        cmask = np.load(Path(self.dir, "caption_mask.npy"), mmap_mode="r")
+        order = list(range(self.total))
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(order)
+        wi = get_worker_info()
+        if wi is not None:                      # 多 worker：按下标取模切分，互不重叠
+            order = order[wi.id::wi.num_workers]
+        for i in order:
+            # 每张图（=一行）随机取一条 caption（同图多描述会互成假负例，故每行只出一个样本）
+            k = random.Random(self.seed + self.epoch * 1000003 + i).randrange(self.num_captions)
+            # uint16 memmap → bf16 张量：.copy() 保证可写连续（from_numpy 视图不能 view）
+            yield {"patches": torch.from_numpy(patches[i].copy()).view(torch.bfloat16),
+                   "grid": self.grid,
+                   "text_ids": torch.from_numpy(caps[i, k].copy()).long(),
+                   "text_mask": torch.from_numpy(cmask[i, k].copy()).bool()}

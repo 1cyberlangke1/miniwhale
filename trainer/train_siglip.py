@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
-from model.train.data import ImageTextPairDataset
+from model.train.data import ImageTextPairDataset, PreprocessedPairDataset
 from model.train.siglip import SigLIP
 from model.train.compile import maybe_compile
 from model.train.optim import make_optimizers, set_base_lr
@@ -71,22 +71,25 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
                 max_steps=None):
     """跑一个 epoch（SigLIP 对比）。
 
-    输入：epoch；loader；model（SigLIP 双塔）；三个优化器；args；start_step；max_steps（步数上限，None=跑满）。
-    输出：本 epoch 平均 loss。
+    输入：epoch；loader；model（SigLIP 双塔）；三个优化器；args；
+          start_step（本 epoch 起始的**全局**步数——lr 调度与 checkpoint 间隔都按它算）；
+          max_steps（本 epoch 步数上限，None=跑满）。
+    输出：(本 epoch 平均 loss, 实际步数)。
     预期行为：bf16 autocast 前向；pairwise sigmoid loss；梯度累积 + 裁剪；
               每步按 warmup+cosine 更新三个优化器的 lr。max_steps=0 时一步都不跑。
     """
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
-    for step, batch in enumerate(loader, start=start_step):
-        if max_steps is not None and step - start_step >= max_steps:
+    for step, batch in enumerate(loader):
+        if max_steps is not None and step >= max_steps:
             break
         # 对比损失需要 batch 内至少 2 个样本（1×1 的 logits 退化）
         if batch is None or batch["text_ids"].size(0) < 2:
             continue
+        gstep = start_step + step          # **全局**步数：lr 调度与 checkpoint 都按它算
         t_step0 = time.time()
-        lr = get_lr(step, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
+        lr = get_lr(gstep, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
         set_base_lr((muon, adamw, sinkhorn), lr)
         text_ids = batch["text_ids"].to(args.device)
         text_mask = batch["text_mask"].to(args.device)
@@ -95,25 +98,33 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
             logits = model(patches, batch["grid"], text_ids, text_mask)
             loss = SigLIP.loss(logits) / args.accumulation_steps
         loss.backward()
-        if (step + 1) % args.accumulation_steps == 0:
+        if (gstep + 1) % args.accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             muon.step(); adamw.step(); sinkhorn.step()
             muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad()
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
-        if step % args.log_interval == 0:
+        if gstep % args.log_interval == 0:
             # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度
             now = time.time()
-            print(f"epoch {epoch} step {step} loss {total_loss / steps:.4f} "
+            print(f"epoch {epoch} step {gstep} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
                   f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
             t_step0 = now
-        if args.save_interval and (step + 1) % args.save_interval == 0:
+        if args.save_interval and (gstep + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)
             torch.save(model.image.vit.state_dict(),
-                       os.path.join(args.save_dir, f"vit_siglip_s{step+1}.pth"))
-            print(f"checkpoint saved at step {step+1}", flush=True)
-    return total_loss / max(steps, 1)
+                       os.path.join(args.save_dir, f"vit_siglip_s{gstep+1}.pth"))
+            # 只保留最近 N 个（按 mtime），避免塞满磁盘
+            if args.keep_last_n:
+                cks = sorted(
+                    (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
+                     if f.startswith("vit_siglip_") and f.endswith(".pth")),
+                    key=os.path.getmtime)
+                for old in cks[:-args.keep_last_n]:
+                    os.remove(old)
+            print(f"checkpoint saved at step {gstep+1}", flush=True)
+    return total_loss / max(steps, 1), steps
 
 
 def main():
@@ -125,6 +136,10 @@ def main():
                          "或 flickr30k（列 image+caption 列表）")
     ap.add_argument("--image_size", type=int, default=224,
                     help="把图统一 resize 到 N×N（0=保持原尺寸）；参考实现 SigLIP 阶段为 224")
+    ap.add_argument("--shuffle_buffer", type=int, default=0,
+                    help="流式 shuffle 缓冲（0=顺序读）。图文对数据设 0：流式读 parquet 的 "
+                         "Image 列时，shuffle 需先把 buffer_size 行**物化解码**进内存，"
+                         "对 512 大 batch 是严重的 I/O/CPU 放大，收益却很小（每 epoch 已换图序+换 caption）。")
     ap.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
     ap.add_argument("--steps", type=int, default=0,
                     help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
@@ -141,10 +156,12 @@ def main():
     ap.add_argument("--text_dim", type=int, default=256, help="文本塔隐藏维")
     ap.add_argument("--text_layers", type=int, default=4, help="文本塔层数")
     ap.add_argument("--text_heads", type=int, default=4, help="文本塔注意力头数")
-    ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--log_interval", type=int, default=200)
     ap.add_argument("--save_interval", type=int, default=1000,
                     help="每多少步存一次 checkpoint（0=不存）")
+    ap.add_argument("--keep_last_n", type=int, default=3,
+                    help="只保留最近 N 个 checkpoint（0=全留）")
     ap.add_argument("--save_dir", default="out")
     ap.add_argument("--compile", action="store_true",
                     help="用 torch.compile 加速训练（保持 inductor 默认数值语义）")
@@ -163,9 +180,14 @@ def main():
     model.cfg = cfg
     model = maybe_compile(model, args.compile, args.compile_mode)
 
-    ds = ImageTextPairDataset(args.data_path, tokenizer, max_length=args.caption_len,
-                              vision_cfg=cfg.vision, source=args.source,
-                              image_size=args.image_size)
+    # 预处理目录（含 meta.json）：读离线张量，零现场解码；否则现场从 parquet 解码。
+    if os.path.isfile(os.path.join(args.data_path, "meta.json")):
+        ds = PreprocessedPairDataset(args.data_path)
+    else:
+        ds = ImageTextPairDataset(args.data_path, tokenizer, max_length=args.caption_len,
+                                  vision_cfg=cfg.vision, source=args.source,
+                                  image_size=args.image_size,
+                                  shuffle_buffer=args.shuffle_buffer)
     # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
     # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
     if not args.steps and not args.epochs:
@@ -188,11 +210,13 @@ def main():
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
     os.makedirs(args.save_dir, exist_ok=True)
+    global_step = 0
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮重排 shard 顺序 + shuffle buffer
-        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
-                           max_steps=max_steps)
-        print(f"epoch {epoch} done, avg loss {loss:.4f}")
+        loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
+                              start_step=global_step, max_steps=max_steps)
+        global_step += n   # 跨 epoch 累加：lr 余弦调度与 checkpoint 间隔都按全局步数
+        print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {global_step} 步）")
 
     # 只留视觉编码器（参考实现：丢弃 LLM，保留优化后的 ViT）
     torch.save(model.image.vit.state_dict(), os.path.join(args.save_dir, "vit_siglip.pth"))

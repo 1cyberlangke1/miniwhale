@@ -60,12 +60,13 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
-    for step, batch in enumerate(loader, start=start_step):
-        if max_steps is not None and step - start_step >= max_steps:
+    for step, batch in enumerate(loader):
+        if max_steps is not None and step >= max_steps:
             break
+        gstep = start_step + step          # **全局**步数：lr 调度与 checkpoint 都按它算
         t_step0 = time.time()
         # 只更新基准 lr，各组按 lr_mult 缩放（保留 Engram ×5，参考实现 §4.2.2）
-        lr = get_lr(step, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
+        lr = get_lr(gstep, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
         set_base_lr((muon, adamw, sinkhorn), lr)
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)
@@ -96,24 +97,24 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
             loss = loss / args.accumulation_steps
         IndexerLossAutoScaler.set_loss_scale(loss.detach())
         loss.backward()
-        if (step + 1) % args.accumulation_steps == 0:
+        if (gstep + 1) % args.accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             muon.step(); adamw.step(); sinkhorn.step()
             muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad()
             model.update_router_bias(args.router_bias_rate)
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
-        if step % args.log_interval == 0:
+        if gstep % args.log_interval == 0:
             # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度
             now = time.time()
-            print(f"epoch {epoch} step {step} loss {total_loss / steps:.4f} "
+            print(f"epoch {epoch} step {gstep} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
                   f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
             t_step0 = now
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
-        if args.save_interval and (step + 1) % args.save_interval == 0:
+        if args.save_interval and (gstep + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)
-            path = os.path.join(args.save_dir, f"sft_e{epoch}_s{step+1}.pth")
+            path = os.path.join(args.save_dir, f"sft_e{epoch}_s{gstep+1}.pth")
             torch.save(model.state_dict(), path)
             if args.keep_last_n:
                 cks = sorted(
@@ -122,8 +123,8 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
                     key=os.path.getmtime)
                 for old in cks[:-args.keep_last_n]:
                     os.remove(old)
-            print(f"checkpoint saved at step {step+1}", flush=True)
-    return total_loss / max(steps, 1)
+            print(f"checkpoint saved at step {gstep+1}", flush=True)
+    return total_loss / max(steps, 1), steps
 
 
 def main():
@@ -199,11 +200,13 @@ def main():
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
     os.makedirs(args.save_dir, exist_ok=True)
+    global_step = 0
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
-        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
-                           max_steps=max_steps)
-        print(f"epoch {epoch} done, avg loss {loss:.4f}")
+        loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
+                              start_step=global_step, max_steps=max_steps)
+        global_step += n   # 跨 epoch 累加：lr 余弦调度与 checkpoint 间隔都按全局步数
+        print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {global_step} 步）")
     torch.save(model.state_dict(), os.path.join(args.save_dir, "sft.pth"))
     print("SFT 完成，已保存 sft.pth")
 
