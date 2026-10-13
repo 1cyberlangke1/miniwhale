@@ -128,7 +128,7 @@ def main():
     ap.add_argument("--ckpt", default=None, help="已训练的主干权重（可选）")
     ap.add_argument("--vit_ckpt", default=None,
                     help="第一阶段（SigLIP 对比）产出的视觉编码器权重（可选；按参考实现两阶段）")
-    ap.add_argument("--epochs", type=int, default=1, help="训练轮数（默认 1）")
+    ap.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
     ap.add_argument("--steps", type=int, default=0,
                     help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
     ap.add_argument("--seq_len", type=int, default=512)
@@ -172,7 +172,10 @@ def main():
 
     ds = MultimodalDataset(args.data_path, tokenizer, max_length=args.seq_len,
                            image_token_id=cfg.text.image_token_id, vision_cfg=cfg.vision)
-    # 训练模式：默认 steps=0、epochs=1。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
+    if not args.steps and not args.epochs:
+        ap.error("必须显式指定 --epochs 或 --steps（默认都为 0，不跑）")
     if args.steps and args.epochs:
         print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
               f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
@@ -186,7 +189,7 @@ def main():
                             else max(len(ds) // args.batch_size, 1) * epochs_to_run)
     print(f"数据集 {len(ds)} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+    loader = DataLoader(ds, batch_size=args.batch_size,
                         num_workers=args.num_workers, collate_fn=collate_fn)
 
     # 主干 + ViT/Aligner 一起训（参考实现：视觉塔与 LLM 联合优化）
@@ -194,6 +197,7 @@ def main():
 
     os.makedirs(args.save_dir, exist_ok=True)
     for epoch in range(epochs_to_run):
+        ds.set_epoch(epoch)  # 流式数据集：每轮重排 shard 顺序 + shuffle buffer
         loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
                            max_steps=max_steps)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")

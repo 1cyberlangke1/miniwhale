@@ -75,9 +75,9 @@ def main():
     ap = argparse.ArgumentParser(description="miniwhale DSpark 训练")
     ap.add_argument("--data_path", default="dataset/pretrain_t2t_mini.jsonl")
     ap.add_argument("--ckpt", default=None, help="已训练的 backbone 权重（可选）")
-    ap.add_argument("--epochs", type=int, default=1, help="训练轮数（默认 1）")
+    ap.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
     ap.add_argument("--steps", type=int, default=0,
-                    help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
+                    help="按步数训练（默认 0=不跑）；与 --epochs 同时指定时 epoch 优先")
     ap.add_argument("--seq_len", type=int, default=256)
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--lr", type=float, default=6e-4, help="参考实现 lr=6e-4")
@@ -115,7 +115,10 @@ def main():
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95))
     model.train()
 
-    # 训练模式：默认 steps=0、epochs=1。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
+    if not args.steps and not args.epochs:
+        ap.error("必须显式指定 --epochs 或 --steps（默认都为 0，不跑）")
     if args.steps and args.epochs:
         print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
               f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
@@ -126,6 +129,8 @@ def main():
         total_steps = max(len(ds) // args.batch, 1) * args.epochs
 
     tc = cfg.text
+    epoch = 0
+    ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
     it = iter(loader)
     for step in range(total_steps):
         lr = get_lr(step, total_steps, args.warmup_steps, args.lr, args.min_lr)
@@ -134,6 +139,8 @@ def main():
         try:
             batch = next(it)
         except StopIteration:
+            epoch += 1
+            ds.set_epoch(epoch)  # 新一轮：换 seed 重排，避免每轮顺序一样
             it = iter(loader); batch = next(it)
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)

@@ -115,7 +115,7 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
 def main():
     ap = argparse.ArgumentParser(description="miniwhale ViT SigLIP 对比预训练")
     ap.add_argument("--data_path", default="dataset/sft_i2t_mini.parquet")
-    ap.add_argument("--epochs", type=int, default=1, help="训练轮数（默认 1）")
+    ap.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
     ap.add_argument("--steps", type=int, default=0,
                     help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
     ap.add_argument("--batch_size", type=int, default=8)
@@ -155,7 +155,10 @@ def main():
 
     ds = ImageTextPairDataset(args.data_path, tokenizer, max_length=args.caption_len,
                               vision_cfg=cfg.vision)
-    # 训练模式：默认 steps=0、epochs=1。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
+    if not args.steps and not args.epochs:
+        ap.error("必须显式指定 --epochs 或 --steps（默认都为 0，不跑）")
     if args.steps and args.epochs:
         print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
               f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
@@ -169,12 +172,13 @@ def main():
                             else max(len(ds) // args.batch_size, 1) * epochs_to_run)
     print(f"数据集 {len(ds)} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
+    loader = DataLoader(ds, batch_size=args.batch_size,
                         num_workers=args.num_workers, collate_fn=collate_fn)
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
     os.makedirs(args.save_dir, exist_ok=True)
     for epoch in range(epochs_to_run):
+        ds.set_epoch(epoch)  # 流式数据集：每轮重排 shard 顺序 + shuffle buffer
         loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
                            max_steps=max_steps)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")

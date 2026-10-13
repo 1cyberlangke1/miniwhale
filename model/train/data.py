@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import IterableDataset
 
 
 class PretrainDataset(IterableDataset):
@@ -44,12 +44,20 @@ class PretrainDataset(IterableDataset):
         n_docs = splits["train"].num_examples if splits and "train" in splits else 0
         # 每条文档 = 1 个训练样本（不打包），故样本数即文档数。用于 lr 调度总步数。
         self.num_rows = n_docs
+        # 流式：把 shuffle 建在 __init__（**持久**对象），每 epoch 用 set_epoch 换 seed 重排；
+        # 建在 __iter__ 里会因 seed 固定 → 每轮顺序一模一样（等于没打乱）。
+        if streaming and shuffle:
+            self.samples = self.samples.shuffle(buffer_size=shuffle, seed=seed)
+
+    def set_epoch(self, epoch: int):
+        """每 epoch 前调用：流式 shuffle 有效 seed = seed + epoch，重排数据顺序。"""
+        if self.streaming and self.shuffle and hasattr(self.samples, "set_epoch"):
+            self.samples.set_epoch(epoch)
 
     def _stream(self):
         """按配置返回文档流（流式打乱 / 顺序）。"""
         if self.streaming:
-            return self.samples.shuffle(buffer_size=self.shuffle, seed=self.seed) \
-                if self.shuffle else self.samples
+            return self.samples
         return (self.samples[i] for i in torch.randperm(len(self.samples)).tolist())
 
     def __iter__(self):
@@ -101,6 +109,14 @@ class SFTDataset(IterableDataset):
                                 add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f"{tokenizer.eos_token}\n",
                                 add_special_tokens=False).input_ids
+        # 流式：shuffle 建在 __init__（持久对象），每 epoch 用 set_epoch 换 seed 重排。
+        if streaming and shuffle:
+            self.samples = self.samples.shuffle(buffer_size=shuffle, seed=seed)
+
+    def set_epoch(self, epoch: int):
+        """每 epoch 前调用：流式 shuffle 有效 seed = seed + epoch，重排数据顺序。"""
+        if self.streaming and self.shuffle and hasattr(self.samples, "set_epoch"):
+            self.samples.set_epoch(epoch)
 
     def generate_labels(self, input_ids):
         """只在 assistant 段算 loss（照 minimind）。
@@ -146,9 +162,7 @@ class SFTDataset(IterableDataset):
 
     def __iter__(self):
         if self.streaming:
-            ds = self.samples.shuffle(buffer_size=self.shuffle, seed=self.seed) \
-                if self.shuffle else self.samples
-            for row in ds:
+            for row in self.samples:
                 yield self._encode(row)
         else:
             order = torch.randperm(len(self.samples)).tolist()
@@ -159,19 +173,23 @@ class SFTDataset(IterableDataset):
         return self.num_rows
 
 
-class MultimodalDataset(Dataset):
-    """多模态 SFT 数据集（parquet：conversations + image_bytes）。
+class MultimodalDataset(IterableDataset):
+    """多模态 SFT 数据集（parquet：conversations + image_bytes）——**流式**读取。
 
-    输入：parquet 路径；tokenizer；max_length；vision 配置（patch/下采样/尺寸约束）。
-    输出：{"input_ids": [L], "labels": [L], "token_types": [L], "images": list[ImageInput]}。
-    预期行为：按参考实现 image_processor —— `<image>` 占位符展开成
+    输入：parquet 路径；tokenizer；max_length；vision 配置（patch/下采样/尺寸约束）；
+          shuffle_buffer（近似 shuffle 缓冲，0=顺序）。
+    输出（迭代）：{"input_ids": [L], "labels": [L], "token_types": [L], "images": list[ImageInput]}。
+    预期行为：用 `datasets.load_dataset(..., streaming=True)` 原地流式读原 parquet（不复制、
+              不落缓存）；`reshard()` 按 row group 切 shard，DataLoader 的 num_workers 各占
+              互不相交的 shard。按参考实现 image_processor —— `<image>` 占位符展开成
               [IMAGE_START] + ([IMAGE]*w + [IMAGE_NEW_LINE])*h + [IMAGE_END]，全用同一
               image_token_id，靠 token_types 区分；图像切成 ViT patch。
     """
 
     def __init__(self, data_path: str | Path, tokenizer, max_length: int = 768,
                  image_placeholder: str = "<image>", image_token_id: int = 12,
-                 vision_cfg=None, row_group_size: int = 64):
+                 vision_cfg=None, shuffle_buffer: int = 10000, seed: int = 42):
+        from datasets import load_dataset
         import pyarrow.parquet as pq
 
         self.tokenizer = tokenizer
@@ -180,11 +198,23 @@ class MultimodalDataset(Dataset):
         self.image_token_id = image_token_id
         self.vision_cfg = vision_cfg
         self.path = str(data_path)
-        self.pf = pq.ParquetFile(self.path)
-        self.row_group_size = row_group_size
+        # 行数：只读 parquet footer 元数据（几 KB），不加载数据。
+        self._num_rows = pq.ParquetFile(self.path).metadata.num_rows
+        # 流式读原文件（streaming=True：**不复制、不落缓存**，原地按 row group 读）。
+        # reshard() 按 row group 切 shard，num_workers 各占互不相交的 shard（库保证不重读）。
+        self.samples = load_dataset("parquet", data_files=self.path,
+                                    split="train", streaming=True).reshard()
+        if shuffle_buffer:
+            # 近似 shuffle（shard 顺序打乱 + shuffle buffer），每 epoch 用 set_epoch 重排。
+            self.samples = self.samples.shuffle(buffer_size=shuffle_buffer, seed=seed)
 
     def __len__(self):
-        return self.pf.metadata.num_rows
+        return self._num_rows
+
+    def set_epoch(self, epoch: int):
+        """每个 epoch 前调用：重排 shard 顺序与 shuffle buffer（有效 seed = seed + epoch）。"""
+        if hasattr(self.samples, "set_epoch"):
+            self.samples.set_epoch(epoch)
 
     def _image_inputs(self, prompt_ids, raw_images, max_length):
         """把 prompt 里的 image_token 占位展开成参考实现图像 span。
@@ -226,15 +256,19 @@ class MultimodalDataset(Dataset):
             token_types += types.tolist()
         return tokens, token_types, images
 
-    def __getitem__(self, index):
+    def __iter__(self):
+        for row in self.samples:
+            yield self._encode_row(row)
+
+    def _encode_row(self, row):
+        """把一行 parquet 记录编码成训练样本。
+
+        输入：row dict（conversations + image_bytes）。
+        输出：{"input_ids": [L], "labels": [L], "token_types": [L], "images": list[ImageInput]}。
+        预期行为：chat template 渲染 → 有图则把 image 占位展开成参考实现 span；pad 位 label=-100。
+        """
         import json
 
-        # 不整表加载（数 GB）：按全局行号定位所属 row group，再读那一组
-        rg, offset = 0, index
-        while rg < self.pf.num_row_groups and offset >= self.pf.metadata.row_group(rg).num_rows:
-            offset -= self.pf.metadata.row_group(rg).num_rows
-            rg += 1
-        row = self.pf.read_row_group(rg).slice(offset, 1).to_pylist()[0]
         convs = row["conversations"] or []
         if isinstance(convs, str):
             convs = json.loads(convs)
@@ -268,17 +302,21 @@ class MultimodalDataset(Dataset):
                 "images": images}
 
 
-class ImageTextPairDataset(Dataset):
-    """图文对数据集（SigLIP 对比预训练用，报告 §4.2.2 第一阶段）。
+class ImageTextPairDataset(IterableDataset):
+    """图文对数据集（SigLIP 对比预训练用，报告 §4.2.2 第一阶段）——**流式**读取。
 
-    输入：parquet 路径（列 conversations + image_bytes）；tokenizer；max_length。
-    输出：{"patches": [n,3,p,p], "grid": (n_vit_h, n_vit_w), "text_ids": [L], "text_mask": [L]}。
-    预期行为：取首轮 user 文本（含 `<image>` 占位符）作 caption——去掉占位符后分词；
+    输入：parquet 路径（列 conversations + image_bytes）；tokenizer；max_length；
+          shuffle_buffer（近似 shuffle 缓冲，0=顺序）。
+    输出（迭代）：{"patches": [n,3,p,p], "grid": (n_vit_h, n_vit_w), "text_ids": [L], "text_mask": [L]}。
+    预期行为：用 `load_dataset(..., streaming=True)` 原地流式读（不复制、不落缓存）；
+              取首轮 user 文本（含 `<image>` 占位符）作 caption——去掉占位符后分词；
               图像切成 ViT patch。无图或空 caption 的行返回 None（由 collate 过滤）。
     """
 
     def __init__(self, data_path: str | Path, tokenizer, max_length: int = 64,
-                 image_placeholder: str = "<image>", vision_cfg=None, row_group_size: int = 64):
+                 image_placeholder: str = "<image>", vision_cfg=None,
+                 shuffle_buffer: int = 10000, seed: int = 42):
+        from datasets import load_dataset
         import pyarrow.parquet as pq
 
         self.tokenizer = tokenizer
@@ -286,22 +324,40 @@ class ImageTextPairDataset(Dataset):
         self.image_placeholder = image_placeholder
         self.vision_cfg = vision_cfg
         self.path = str(data_path)
-        self.pf = pq.ParquetFile(self.path)
-        self.row_group_size = row_group_size
+        # 行数：只读 parquet footer 元数据（几 KB），不加载数据。
+        self._num_rows = pq.ParquetFile(self.path).metadata.num_rows
+        # 流式读原文件（streaming=True：**不复制、不落缓存**）；reshard() 按 row group
+        # 切 shard，num_workers 各占互不相交的 shard（库保证不重读）。
+        self.samples = load_dataset("parquet", data_files=self.path,
+                                    split="train", streaming=True).reshard()
+        if shuffle_buffer:
+            self.samples = self.samples.shuffle(buffer_size=shuffle_buffer, seed=seed)
 
     def __len__(self):
-        return self.pf.metadata.num_rows
+        return self._num_rows
 
-    def __getitem__(self, index):
+    def set_epoch(self, epoch: int):
+        """每个 epoch 前调用：重排 shard 顺序与 shuffle buffer（有效 seed = seed + epoch）。"""
+        if hasattr(self.samples, "set_epoch"):
+            self.samples.set_epoch(epoch)
+
+    def __iter__(self):
+        for row in self.samples:
+            sample = self._encode_row(row)
+            if sample is not None:
+                yield sample
+
+    def _encode_row(self, row):
+        """把一行图文记录编码成 SigLIP 训练样本（无图/空 caption 返回 None）。
+
+        输入：row dict（conversations + image_bytes）。
+        输出：{"patches", "grid", "text_ids", "text_mask"} 或 None。
+        预期行为：取首轮 user 文本去占位符作 caption；图像切 ViT patch；文本 pad 到 max_length。
+        """
         import json
 
         from model.image_processor import load_image_from_bytes
 
-        rg, offset = 0, index
-        while rg < self.pf.num_row_groups and offset >= self.pf.metadata.row_group(rg).num_rows:
-            offset -= self.pf.metadata.row_group(rg).num_rows
-            rg += 1
-        row = self.pf.read_row_group(rg).slice(offset, 1).to_pylist()[0]
         raw = row.get("image_bytes")
         if not raw:
             return None

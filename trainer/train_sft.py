@@ -127,7 +127,7 @@ def main():
     parser.add_argument("--data_path", type=str, default="dataset/sft_t2t_mini.jsonl")
     parser.add_argument("--ckpt", type=str, default=None, help="预训练权重（可选）")
     parser.add_argument("--save_dir", type=str, default="out")
-    parser.add_argument("--epochs", type=int, default=1, help="训练轮数（默认 1）")
+    parser.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
     parser.add_argument("--steps", type=int, default=0,
                         help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
     parser.add_argument("--batch_size", type=int, default=8)
@@ -172,7 +172,10 @@ def main():
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
     ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-    # 训练模式：默认 steps=0、epochs=1。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
+    # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
+    if not args.steps and not args.epochs:
+        parser.error("必须显式指定 --epochs 或 --steps（默认都为 0，不跑）")
     if args.steps and args.epochs:
         print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
               f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
@@ -193,6 +196,7 @@ def main():
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
     os.makedirs(args.save_dir, exist_ok=True)
     for epoch in range(epochs_to_run):
+        ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
         loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
                            max_steps=max_steps)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")
