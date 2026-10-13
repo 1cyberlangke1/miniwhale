@@ -93,7 +93,13 @@ def check_engram_hash_distribution(model):
 
 
 def check_no_dead_params(model):
-    """无死参数：除参考实现例外外全部有梯度。"""
+    """无死参数：除参考实现例外外全部有梯度。
+
+    例外：gate.bias（noaux_tc 非梯度）、dspark.*/main_proj/main_norm（二阶段单独训）、
+    .indexer.（经 AutoScaler 挂 loss，本前向路径不直接反传）、图像相关参数
+    （image_start/end/newline、gate.bias_vl）——本检查用**纯文本**输入，无图像 token，
+    这些参数天然无梯度（有图像的 vit 训练里它们有梯度）。
+    """
     model.train()
     ids = torch.randint(0, 6400, (2, 32))
     labels = torch.randint(0, 6400, (2, 32))
@@ -101,8 +107,8 @@ def check_no_dead_params(model):
     loss = torch.nn.functional.cross_entropy(
         logits[:, :-1].reshape(-1, logits.size(-1)), labels[:, 1:].reshape(-1))
     loss.backward()
-    allowed = ("ffn.gate.bias",)
-    allowed_prefix = ("dspark.", "main_proj", "main_norm")
+    allowed = ("ffn.gate.bias", "ffn.gate.bias_vl", "image_start", "image_end", "image_newline")
+    allowed_prefix = ("dspark.", "main_proj", "main_norm", "vision.", "aligner.")
     dead = [n for n, p in model.named_parameters()
             if not (n.endswith(allowed) or n.startswith(allowed_prefix) or ".indexer." in n)
             and (p.grad is None or p.grad.abs().sum() == 0)]

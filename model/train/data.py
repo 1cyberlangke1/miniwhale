@@ -201,12 +201,15 @@ class MultimodalDataset(Dataset):
     def __len__(self):
         return self.pf.metadata.num_rows
 
-    def _image_inputs(self, prompt_ids, raw_images):
+    def _image_inputs(self, prompt_ids, raw_images, max_length):
         """把 prompt 里的 image_token 占位展开成参考实现图像 span。
 
-        输入：prompt_ids list[int]；raw_images list[bytes]。
+        输入：prompt_ids list[int]；raw_images list[bytes]；max_length 序列长度上限。
         输出：(tokens list[int], token_types list[int], images list[ImageInput])。
         预期行为：占位符处插入 IMAGE_START/IMAGE/NEW_LINE/END 布局，并记录每张图的 patch。
+                  展开后若总长超过 max_length，停止展开（丢弃其后 token）——保证每个
+                  ImageInput 的 span 完整落在 max_length 内（否则下游 merge 时 mask 与
+                  span 形状不匹配）。
         """
         from model.image_processor import (ImageInput, TEXT, image_token_types,
                                            load_image_from_bytes)
@@ -215,15 +218,24 @@ class MultimodalDataset(Dataset):
         tokens, token_types, images = [], [], []
         img_iter = iter(raw_images)
         for tok in prompt_ids:
+            if len(tokens) >= max_length:
+                break
             if tok != self.image_token_id:
                 tokens.append(tok)
                 token_types.append(TEXT)
                 continue
-            raw = next(img_iter)
+            # 占位符多于实际图（脏数据：prompt 里写了多个 `<image>` 但只附一张图）时，
+            # 多余的占位符跳过——不能 `next()` 抛 StopIteration，否则 DataLoader 会把
+            # 它当作迭代结束、静默终止整个 epoch（整轮训练只跑几步就"完成"）。
+            raw = next(img_iter, None)
+            if raw is None:
+                continue
             patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = load_image_from_bytes(
                 raw, vc.patch_size, vc.downsample_ratio, vc.max_image_tokens,
                 vc.min_pixels, vc.max_wh_ratio)
             types = image_token_types(n_llm_h, n_llm_w)
+            if len(tokens) + types.numel() > max_length:
+                break  # 整张图 span 放不下 → 停止（不半展开，避免 span 越界）
             images.append(ImageInput(len(tokens), patches, n_vit_h, n_vit_w, types))
             tokens += [self.image_token_id] * types.numel()
             token_types += types.tolist()
@@ -259,7 +271,7 @@ class MultimodalDataset(Dataset):
         token_types = [(-1)] * len(ids)
         images = []
         if raw:
-            ids, token_types, images = self._image_inputs(ids, [raw])
+            ids, token_types, images = self._image_inputs(ids, [raw], self.max_length)
 
         pad = self.tokenizer.pad_token_id
         input_ids = ids[:self.max_length] + [pad] * max(0, self.max_length - len(ids))
