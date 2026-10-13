@@ -27,6 +27,7 @@ from model.train.data import SFTDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
+from model.train.dspark_loss import compute_dspark_loss
 from model.train.optim import make_optimizers, set_base_lr
 from model.tokenizer import load_tokenizer
 
@@ -71,6 +72,23 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0)
                 labels[:, 1:].reshape(-1),
                 ignore_index=-100,
             )
+            # post-training 阶段同训 DSpark（照报告 §2.4.3）：主干由上面的 CE 更新；
+            # DSpark 由 DSpark loss 更新。DSpark loss 的 target（主干 hidden/logits）
+            # 天然不带梯度（主干前向在 no_grad 外但 target 走 detach），故其梯度
+            # 不回传主干——正是参考实现「同训但梯度不回传 backbone」的语义。
+            if args.dspark and model.dspark is not None:
+                tc = model.cfg.text
+                loss_mask = (labels != -100).float()
+                out = model.dspark.forward_train(ids, model._last_main_hidden.detach(),
+                                                 loss_mask, aligned_target_logits=logits.detach())
+                dspark_loss = compute_dspark_loss(
+                    out,
+                    loss_decay_gamma=tc.dspark_loss_decay_gamma,
+                    ce_loss_alpha=tc.dspark_ce_loss_alpha,
+                    l1_loss_alpha=tc.dspark_l1_loss_alpha,
+                    confidence_head_alpha=tc.dspark_confidence_head_alpha,
+                )
+                loss = loss + dspark_loss
             loss = loss / args.accumulation_steps
         IndexerLossAutoScaler.set_loss_scale(loss.detach())
         loss.backward()
@@ -120,12 +138,17 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--router_bias_rate", type=float, default=1e-3)
     parser.add_argument("--max_seq_len", type=int, default=768)
-    parser.add_argument("--num_workers", type=int, default=4)
+    # 单 jsonl = 1 个 shard；`datasets` 的分片规则是 worker 数 ≤ shard 数，
+    # 故 >1 会被库自动压回 1（并打 warning）。默认 1 = 实际行为，不误导。
+    parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=1000,
                         help="每多少步存一次 checkpoint（0=不存）")
     parser.add_argument("--keep_last_n", type=int, default=3,
                         help="只保留最近 N 个 checkpoint（0=全留）")
+    parser.add_argument("--dspark", action="store_true",
+                        help="post-training 阶段同训 DSpark（照报告 §2.4.3；主干由 CE 训，"
+                             "DSpark 由 DSpark loss 训，梯度不回传主干）")
     parser.add_argument("--compile", action="store_true",
                         help="用 torch.compile 加速训练（保持 inductor 默认数值语义）")
     parser.add_argument("--compile_mode", type=str, default="default",
@@ -135,7 +158,8 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    torch.set_default_dtype(torch.bfloat16)
+    # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
+    # 见 train_pretrain 同名注释：bf16 参数会让 RMSNorm 权重的更新被舍入抹掉。
 
     cfg = ModelConfig.from_json()
     tokenizer = load_tokenizer()

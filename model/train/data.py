@@ -42,20 +42,8 @@ class PretrainDataset(IterableDataset):
         # 极小的临时文件 datasets 可能不给 splits（None）——回退 0，调用方按 0 处理。
         splits = getattr(self.samples.info, "splits", None)
         n_docs = splits["train"].num_examples if splits and "train" in splits else 0
-        # 打包后的**片段数**（而非文档数）：采样若干文档估平均 token 数，估算总片段数。
-        # 用于 lr 调度总步数；估偏一点无妨（调度只是曲线形状），但必须量级正确。
-        self.num_rows = self._estimate_packed_chunks(n_docs) if n_docs else 0
-
-    def _estimate_packed_chunks(self, n_docs: int, sample: int = 512) -> int:
-        """采样估总 token，除以 max_length 得片段数。"""
-        tot, n = 0, 0
-        for row in self.samples.take(sample) if self.streaming else self.samples.select(range(min(sample, n_docs))):
-            ids = self.tokenizer(str(row["text"]), add_special_tokens=False,
-                                 max_length=self.max_length, truncation=True).input_ids
-            tot += len(ids) + 2  # +bos +eos
-            n += 1
-        avg = tot / max(n, 1)
-        return int(n_docs * avg / self.max_length)
+        # 每条文档 = 1 个训练样本（不打包），故样本数即文档数。用于 lr 调度总步数。
+        self.num_rows = n_docs
 
     def _stream(self):
         """按配置返回文档流（流式打乱 / 顺序）。"""
@@ -65,22 +53,19 @@ class PretrainDataset(IterableDataset):
         return (self.samples[i] for i in torch.randperm(len(self.samples)).tolist())
 
     def __iter__(self):
-        # **序列打包**：把文档首尾相连成一条 token 流，再切成定长片段——零 padding。
-        # 否则短文档（本语料平均 ~160 token）右侧 pad 到 max_length 会浪费 ~80% 的
-        # GPU 算力（算在 pad 上）。打包是标准预训练做法，让 GPU 只算真实 token。
-        buf: list[int] = []
+        # 照 minimind：每条文档右侧 pad 到 max_length（**固定形状** → compile 只编一次）。
+        # 样本各自独立、右侧 pad，天然满足 sample-level masking（不做打包、不做分桶）。
         bos, eos = self.tokenizer.bos_token_id, self.tokenizer.eos_token_id
+        pad = self.tokenizer.pad_token_id
         for row in self._stream():
             ids = self.tokenizer(str(row["text"]), add_special_tokens=False,
-                                 max_length=self.max_length, truncation=True).input_ids
-            buf.append(bos)
-            buf.extend(ids)
-            buf.append(eos)
-            while len(buf) >= self.max_length:
-                chunk = buf[:self.max_length]
-                del buf[:self.max_length]
-                t = torch.tensor(chunk, dtype=torch.long)
-                yield {"input_ids": t, "labels": t.clone()}
+                                 max_length=self.max_length - 2, truncation=True).input_ids
+            toks = ([bos] + ids + [eos])[:self.max_length]
+            t = torch.full((self.max_length,), pad, dtype=torch.long)
+            t[:len(toks)] = torch.tensor(toks, dtype=torch.long)
+            labels = t.clone()
+            labels[t == pad] = -100
+            yield {"input_ids": t, "labels": labels}
 
     def __len__(self):
         return self.num_rows

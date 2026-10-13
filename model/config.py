@@ -73,7 +73,7 @@ class TextConfig:
     # 图像占位 token 的 id（参考实现 image_token_id）；minimind 词表里 <|image_pad|> = 12
     image_token_id: int = 12
 
-    # CSA2 / 跨层共享
+    # CSA2
     sliding_window: int = 128
     compress_ratios: tuple = (0, 0, 2, 2, 1, 1, 1, 1)
     compress_rope_theta: float = 160000.0

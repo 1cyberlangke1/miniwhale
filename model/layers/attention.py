@@ -1,8 +1,8 @@
-"""MLA + CSA2 + 跨层共享。
+"""MLA + CSA2 跨层共享。
 
 每层对两个 KV 源做稀疏注意力并拼接：滑窗原始 KV + （compress_ratio>0 时）index_topk 个压缩位置。
 
-跨层共享：只有 kv_source 层用自己的输入算压缩 KV 并发布；后续层**直接读同一份缓存**（无投影）。
+CSA：只有 kv_source 层用自己的输入算压缩 KV 并发布；后续层**直接读同一份缓存**（无投影）。
 同理 index 源层发布 topk 索引，后续层复用。
 """
 
@@ -270,7 +270,7 @@ class Attention(nn.Module):
         return out.to(q.dtype)
 
     def _compress_kv(self, x, qr, start_pos, offset, shared):
-        """压缩 KV + 压缩位置索引（跨层共享 共享在此发生）。
+        """压缩 KV + 压缩位置索引（CSA 共享在此发生）。
 
         prefill（训练）：源层算出的 latent 直接作为共享张量发布（带梯度，供后续层读）。
         decode：写入缓存供跨步复用。

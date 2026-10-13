@@ -36,19 +36,26 @@ from model.train.optim import make_optimizers, set_base_lr
 from model.tokenizer import load_tokenizer
 
 
-def get_lr(step, total_steps, warmup_steps, base_lr, min_lr):
-    """余弦学习率调度（带线性 warmup），照 minimind 惯例。
+def get_lr(step, total_steps, warmup_steps, base_lr, min_lr,
+           decay_start=0.62, decay_end=0.89):
+    """学习率调度（按参考实现报告 §4.2.2 的三段式）。
 
-    输入：step 当前步；total_steps 总步数；warmup_steps 预热步数；base_lr 峰值 lr；min_lr 最低 lr。
+    输入：step 当前步；total_steps 总步数；warmup_steps 预热步数；base_lr 峰值 lr；
+          min_lr 最低 lr；decay_start / decay_end 余弦衰减窗口（占全程比例）。
     输出：本步的 lr。
-    预期行为：前 warmup_steps 步从 base_lr/10 线性升到 base_lr；
-              之后按余弦从 base_lr 衰减到 min_lr。
+    预期行为：前 warmup_steps 步从 base_lr/10 线性升到 base_lr；之后**恒定**保持 base_lr
+              直到 decay_start·total_steps；再按余弦降到 min_lr（到 decay_end·total_steps）；
+              末尾恒定 min_lr。参考实现：2.6e-4 恒定到 62%，余弦降到 2.6e-5（89%），其后不变。
+    为什么不是「warmup 后立刻余弦」：那样后段 lr 早已衰减到近零，loss 会提前卡住不动。
     """
     if step < warmup_steps:
         return base_lr * (0.1 + 0.9 * step / max(warmup_steps, 1))
-    if step >= total_steps:
+    start, end = decay_start * total_steps, decay_end * total_steps
+    if step <= start:
+        return base_lr
+    if step >= end:
         return min_lr
-    ratio = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    ratio = (step - start) / max(end - start, 1)
     cos = 0.5 * (1.0 + math.cos(math.pi * ratio))
     return min_lr + (base_lr - min_lr) * cos
 
@@ -129,8 +136,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--steps", type=int, default=0, help="最多训练步数（0=跑满 epoch）")
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--learning_rate", type=float, default=5e-4)
-    parser.add_argument("--min_lr", type=float, default=5e-5, help="余弦衰减的最低 lr")
+    parser.add_argument("--learning_rate", type=float, default=2.6e-4,
+                        help="峰值 lr（按参考实现报告 §4.2.2：2.6e-4）")
+    parser.add_argument("--min_lr", type=float, default=2.6e-5, help="余弦衰减的最低 lr")
     parser.add_argument("--warmup_steps", type=int, default=2000, help="线性预热步数")
     parser.add_argument("--total_steps", type=int, default=0,
                         help="余弦调度的总步数（0=按数据集行数 // batch_size 自动）")
@@ -138,8 +146,10 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--router_bias_rate", type=float, default=1e-3,
                         help="noaux_tc 纠正 bias 的更新步长（非梯度）")
-    parser.add_argument("--max_seq_len", type=int, default=768)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--max_seq_len", type=int, default=512)
+    # 单 jsonl = 1 个 shard；`datasets` 的分片规则是 worker 数 ≤ shard 数，
+    # 故 >1 会被库自动压回 1（并打 warning）。默认 1 = 实际行为，不误导。
+    parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=1000,
                         help="每多少步存一次 checkpoint（0=不存）")
@@ -156,7 +166,10 @@ def main():
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
-    torch.set_default_dtype(torch.bfloat16)
+    # 参数保持 **fp32 主权重**（按技术报告 §3.4："the FP32 master weights maintained
+    # by the optimizer"）。计算用 bf16 autocast。若把默认 dtype 设成 bf16，参数直接是 bf16，
+    # RMSNorm 权重（初值 1.0，bf16 ULP≈4e-3）的 AdamW 更新（≈lr≈2.6e-4）会被舍入抹掉 →
+    # norm 权重不更新 → 收敛受阻。
 
     cfg = ModelConfig.from_json()
     tokenizer = load_tokenizer()
@@ -176,8 +189,19 @@ def main():
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
     os.makedirs(args.save_dir, exist_ok=True)
+    start_step = 0
+    if args.resume:
+        # 续训：只恢复模型权重（优化器动量/调度步数不复位，故从 start_step 继续按调度取 lr）
+        state = torch.load(args.resume, map_location=args.device)
+        model.load_state_dict(state)
+        # 从 checkpoint 文件名解析已训步数（pretrain_e{E}_s{STEP}.pth）；解析不到则从 0 起
+        import re
+        m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
+        start_step = int(m.group(1)) if m else 0
+        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
     for epoch in range(args.epochs):
-        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args)
+        loss = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
+                           start_step=start_step)
         print(f"epoch {epoch} done, avg loss {loss:.4f}")
         torch.save(model.state_dict(), os.path.join(args.save_dir, f"pretrain_e{epoch}.pth"))
 

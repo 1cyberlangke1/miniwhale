@@ -151,7 +151,8 @@ def main():
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
-    torch.set_default_dtype(torch.bfloat16)
+    # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
+    # 见 train_pretrain 同名注释：bf16 参数会让 RMSNorm 权重的更新被舍入抹掉。
     tokenizer = load_tokenizer()
     cfg = ModelConfig.from_json()
     model = Model(cfg, tokenizer=tokenizer).to(args.device)

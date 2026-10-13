@@ -242,16 +242,19 @@ class MoE(nn.Module):
         offs = counts.cumsum(0).to(torch.int32)               # 每专家累计 token 数（grouped_mm offsets）
         perm_x = flat[sorted_tok]                             # [n_tok*topk, d] 按专家分组排列
         w1, w2, w3 = self._stacked_weights()
+        # 参数是 fp32 主权重；`_grouped_mm` 要求两个操作数同 dtype，故把权重 cast 到激活的
+        # 计算精度（bf16）——fp32 master 仍在优化器里，这是标准混合精度做法。
+        wd = perm_x.dtype
         # 与 Expert 语义对齐：w1/w3 的 bf16 matmul 结果上转 fp32 再做 SwiGLU（Expert 里 gate/up 均 .float()）
-        gate = torch._grouped_mm(perm_x, w1.transpose(-2, -1), offs=offs).float()
-        up = torch._grouped_mm(perm_x, w3.transpose(-2, -1), offs=offs).float()
+        gate = torch._grouped_mm(perm_x, w1.transpose(-2, -1).to(wd), offs=offs).float()
+        up = torch._grouped_mm(perm_x, w3.transpose(-2, -1).to(wd), offs=offs).float()
         if self.experts[0].swiglu_limit > 0:
             lim = self.experts[0].swiglu_limit
             up = torch.clamp(up, min=-lim, max=lim)
             gate = torch.clamp(gate, max=lim)
         h = F.silu(gate) * up
         h = h * sorted_w.unsqueeze(-1)                        # 路由权重（fp32）
-        y = torch._grouped_mm(h.to(perm_x.dtype), w2.transpose(-2, -1), offs=offs)
+        y = torch._grouped_mm(h.to(wd), w2.transpose(-2, -1).to(wd), offs=offs)
         out = torch.zeros_like(flat, dtype=torch.float32)
         out.index_add_(0, sorted_tok, y.float())             # 按 token 累加其 top-k 贡献
         for shared in self.shared_experts:
