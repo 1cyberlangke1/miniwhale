@@ -42,10 +42,13 @@ def maybe_compile(model: nn.Module, enabled: bool, mode: str = "default") -> nn.
     # SigLIP 对比阶段（双塔，非主干 Model）：文本塔逐层 + 图像塔的 ViT 逐块 compile。
     # 图像塔逐图调用（patch 数随分辨率变化），故按 block 编译而非整个 ViT。
     if not hasattr(model, "layers") and hasattr(model, "text") and hasattr(model, "image"):
+        # 文本塔形状固定（B, L 固定）→ 静态编译。
         for blk in model.text.blocks:
             blk.forward = torch.compile(blk.forward, mode=mode)
+        # 图像塔 patch 数随分辨率变化（序列长不定）→ **动态形状**编译：一张图吃所有
+        # patch 数，避免每遇新形状重编译（重编译比不编译还慢）。
         for blk in model.image.vit.blocks:
-            blk.forward = torch.compile(blk.forward, mode=mode)
+            blk.forward = torch.compile(blk.forward, mode=mode, dynamic=True)
         return model
     # 逐层 compile：每层独立成图；只替换 forward（不包成 OptimizedModule），
     # 以免 state_dict 键被加 `_orig_mod.` 前缀。Block.forward 是同一个 code object，

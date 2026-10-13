@@ -98,12 +98,26 @@ class ImageEncoder(nn.Module):
         self.vit = ViT(vision_cfg)
         self.proj = Linear(vision_cfg.hidden_size, proj_dim)
 
-    def forward_one(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
-        """单图：ViT [n,dim] → 平均池化 [dim] → 投影 [proj_dim]。"""
-        return self.proj(self.vit(patches, n_h, n_w).mean(dim=0))
-
     def forward(self, patches_list, grid_list) -> torch.Tensor:
-        outs = [self.forward_one(p, h, w) for p, (h, w) in zip(patches_list, grid_list)]
+        """整批图像编码：**按 patch 形状分组**，同形状 stack 成一次大前向。
+
+        输入：patches_list list[[n_i,3,p,p]]；grid_list list[(n_vit_h,n_vit_w)]（每图一个）。
+        输出：[B, proj_dim]（L2 归一化，fp32）。
+        预期行为：同 patch 数的图堆成一个 batch 一次过 ViT（省 kernel 启动，数据无关）；
+                  不同 patch 数的图各成一组。每组内逐图平均池化后投影，再按原序拼回。
+                  单图时等价于直接过 ViT。
+        """
+        outs: list[torch.Tensor | None] = [None] * len(patches_list)
+        groups: dict[tuple, list] = {}
+        for i, (p, g) in enumerate(zip(patches_list, grid_list)):
+            groups.setdefault(tuple(p.shape), []).append((i, p, g))
+        for idxs in groups.values():
+            stack = torch.stack([p for _, p, _ in idxs])       # [G, n, 3, p, p]
+            n_h, n_w = idxs[0][2]
+            feats = self.vit(stack, n_h, n_w)                  # [G, n, dim]
+            proj = self.proj(feats.mean(dim=1))                # [G, proj_dim]
+            for (i, _, _), row in zip(idxs, proj):
+                outs[i] = row
         return F.normalize(torch.stack(outs).float(), dim=-1)
 
 

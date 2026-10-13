@@ -305,30 +305,43 @@ class MultimodalDataset(IterableDataset):
 class ImageTextPairDataset(IterableDataset):
     """图文对数据集（SigLIP 对比预训练用，报告 §4.2.2 第一阶段）——**流式**读取。
 
-    输入：parquet 路径（列 conversations + image_bytes）；tokenizer；max_length；
-          shuffle_buffer（近似 shuffle 缓冲，0=顺序）。
+    输入：parquet 路径（可含通配符，多分片）；tokenizer；max_length；
+          shuffle_buffer（近似 shuffle 缓冲，0=顺序）；
+          source 数据格式："conversations"（列 conversations + image_bytes，多模态对话）
+          或 "flickr30k"（列 image[PIL] + caption[list[str]]，标准图文对）；
+          image_size 把图统一 resize 到 N×N（0=保持原尺寸）——参考实现 SigLIP 阶段
+          固定 224×224，且固定形状才能让同批图一次过 ViT（否则按 patch 数分组，组碎）。
     输出（迭代）：{"patches": [n,3,p,p], "grid": (n_vit_h, n_vit_w), "text_ids": [L], "text_mask": [L]}。
     预期行为：用 `load_dataset(..., streaming=True)` 原地流式读（不复制、不落缓存）；
-              取首轮 user 文本（含 `<image>` 占位符）作 caption——去掉占位符后分词；
-              图像切成 ViT patch。无图或空 caption 的行返回 None（由 collate 过滤）。
+              conversations 取首轮 assistant 文本（图像描述）去占位符作 caption；
+              flickr30k 每行 5 条描述，**随机取一条**（同图多描述若都当独立正例，
+              会互成假负例，故每行只出一个样本）。图像切成 ViT patch；
+              无图或空 caption 的行返回 None（由 collate 过滤）。
     """
 
     def __init__(self, data_path: str | Path, tokenizer, max_length: int = 64,
                  image_placeholder: str = "<image>", vision_cfg=None,
-                 shuffle_buffer: int = 10000, seed: int = 42):
-        from datasets import load_dataset
+                 shuffle_buffer: int = 10000, seed: int = 42, source: str = "conversations",
+                 image_size: int = 0):
+        import glob as _glob
+
         import pyarrow.parquet as pq
+        from datasets import load_dataset
 
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.image_placeholder = image_placeholder
         self.vision_cfg = vision_cfg
         self.path = str(data_path)
-        # 行数：只读 parquet footer 元数据（几 KB），不加载数据。
-        self._num_rows = pq.ParquetFile(self.path).metadata.num_rows
+        self.source = source
+        self.seed = seed
+        self.image_size = image_size
+        # 行数：只读各分片 parquet footer 元数据（几 KB），不加载数据。支持通配符多分片。
+        files = sorted(_glob.glob(self.path)) if _glob.has_magic(self.path) else [self.path]
+        self._num_rows = sum(pq.ParquetFile(f).metadata.num_rows for f in files)
         # 流式读原文件（streaming=True：**不复制、不落缓存**）；reshard() 按 row group
         # 切 shard，num_workers 各占互不相交的 shard（库保证不重读）。
-        self.samples = load_dataset("parquet", data_files=self.path,
+        self.samples = load_dataset("parquet", data_files=files,
                                     split="train", streaming=True).reshard()
         if shuffle_buffer:
             self.samples = self.samples.shuffle(buffer_size=shuffle_buffer, seed=seed)
@@ -350,32 +363,60 @@ class ImageTextPairDataset(IterableDataset):
     def _encode_row(self, row):
         """把一行图文记录编码成 SigLIP 训练样本（无图/空 caption 返回 None）。
 
-        输入：row dict（conversations + image_bytes）。
+        输入：row dict（按 self.source 取图与 caption）。
         输出：{"patches", "grid", "text_ids", "text_mask"} 或 None。
-        预期行为：取首轮 user 文本去占位符作 caption；图像切 ViT patch；文本 pad 到 max_length。
+        预期行为：conversations 格式取首轮 assistant 文本；flickr30k 格式随机取 5 条描述之一；
+                  图像切 ViT patch；文本 pad 到 max_length。
         """
-        import json
+        import random
 
-        from model.image_processor import load_image_from_bytes
+        from model.image_processor import load_image
 
-        raw = row.get("image_bytes")
-        if not raw:
-            return None
-        convs = row.get("conversations") or []
-        if isinstance(convs, str):
-            convs = json.loads(convs)
-        # 取首轮 user 文本当 caption（去掉图像占位符）
-        caption = ""
-        for c in convs:
-            if c.get("role") == "user":
-                caption = str(c.get("content", "")).replace(self.image_placeholder, "").strip()
-                break
+        vc = self.vision_cfg
+        if self.source == "flickr30k":
+            image = row.get("image")
+            if image is None:
+                return None
+            caps = row.get("caption") or []
+            if not caps:
+                return None
+            # 每张图 5 条描述：随机取一条（同图其它描述会被当假负例，故每行只出一个样本）。
+            caption = str(random.choice(caps)).strip()
+            # 统一 resize 到 N×N：参考实现 SigLIP 阶段固定 224×224；固定形状才能让同批图
+            # 一次过 ViT（否则按 patch 数分组，图尺寸各异 → 组碎、kernel 启动多、慢）。
+            if self.image_size:
+                image = image.convert("RGB").resize((self.image_size, self.image_size))
+            patches, n_vit_h, n_vit_w, _, _ = load_image(
+                image, vc.patch_size, vc.downsample_ratio, vc.max_image_tokens,
+                vc.min_pixels, vc.max_wh_ratio)
+        else:
+            import json
+
+            from model.image_processor import load_image_from_bytes
+
+            raw = row.get("image_bytes")
+            if not raw:
+                return None
+            convs = row.get("conversations") or []
+            if isinstance(convs, str):
+                convs = json.loads(convs)
+            # 取首轮 assistant 文本当 caption（去掉图像占位符）。
+            # 数据是 VQA 格式：user 段是**问题**（如"对应的内容是什么？"），assistant 段才是
+            # **图像描述**。对比学习要的是「图 ↔ 描述」配对，取 user（问题）会得到无语义的
+            # 负样本（图文对不上），检索指标会被拉垮。参考实现 SigLIP 阶段用 alt-text（描述）同理。
+            caption = ""
+            for c in convs:
+                if c.get("role") == "assistant":
+                    caption = str(c.get("content", "")).replace(
+                        self.image_placeholder, "").strip()
+                    break
+            if not caption:
+                return None
+            patches, n_vit_h, n_vit_w, _, _ = load_image_from_bytes(
+                raw, vc.patch_size, vc.downsample_ratio, vc.max_image_tokens,
+                vc.min_pixels, vc.max_wh_ratio)
         if not caption:
             return None
-        vc = self.vision_cfg
-        patches, n_vit_h, n_vit_w, _, _ = load_image_from_bytes(
-            raw, vc.patch_size, vc.downsample_ratio, vc.max_image_tokens,
-            vc.min_pixels, vc.max_wh_ratio)
         ids = self.tokenizer(caption, add_special_tokens=False,
                              max_length=self.max_length, truncation=True)["input_ids"]
         pad = self.tokenizer.pad_token_id

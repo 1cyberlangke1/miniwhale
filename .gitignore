@@ -38,8 +38,9 @@ hs_err_pid*
 # 临时 clone / 临时目录
 tmp/
 
-# 训练数据（体积大，不入库）
-dataset/
+# 训练数据（体积大，不入库）；README 记录来源，保留
+dataset/*
+!dataset/README.md
 
 # 训练输出（权重/日志，体积大，不入库）
 out/

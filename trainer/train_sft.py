@@ -63,6 +63,7 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
     for step, batch in enumerate(loader, start=start_step):
         if max_steps is not None and step - start_step >= max_steps:
             break
+        t_step0 = time.time()
         # 只更新基准 lr，各组按 lr_mult 缩放（保留 Engram ×5，参考实现 §4.2.2）
         lr = get_lr(step, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
         set_base_lr((muon, adamw, sinkhorn), lr)
@@ -103,9 +104,12 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
         if step % args.log_interval == 0:
+            # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度
+            now = time.time()
             print(f"epoch {epoch} step {step} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
-                  f"{(time.time()-t0)/max(steps,1)*1000:.0f}ms/step", flush=True)
+                  f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
+            t_step0 = now
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
         if args.save_interval and (step + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)

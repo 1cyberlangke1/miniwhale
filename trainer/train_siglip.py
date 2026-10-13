@@ -85,6 +85,7 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         # 对比损失需要 batch 内至少 2 个样本（1×1 的 logits 退化）
         if batch is None or batch["text_ids"].size(0) < 2:
             continue
+        t_step0 = time.time()
         lr = get_lr(step, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
         set_base_lr((muon, adamw, sinkhorn), lr)
         text_ids = batch["text_ids"].to(args.device)
@@ -101,9 +102,12 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
         if step % args.log_interval == 0:
+            # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度
+            now = time.time()
             print(f"epoch {epoch} step {step} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
-                  f"{(time.time()-t0)/max(steps,1)*1000:.0f}ms/step", flush=True)
+                  f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
+            t_step0 = now
         if args.save_interval and (step + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)
             torch.save(model.image.vit.state_dict(),
@@ -115,6 +119,12 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
 def main():
     ap = argparse.ArgumentParser(description="miniwhale ViT SigLIP 对比预训练")
     ap.add_argument("--data_path", default="dataset/sft_i2t_mini.parquet")
+    ap.add_argument("--source", default="conversations",
+                    choices=["conversations", "flickr30k"],
+                    help="数据格式：conversations（列 conversations+image_bytes）"
+                         "或 flickr30k（列 image+caption 列表）")
+    ap.add_argument("--image_size", type=int, default=224,
+                    help="把图统一 resize 到 N×N（0=保持原尺寸）；参考实现 SigLIP 阶段为 224")
     ap.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
     ap.add_argument("--steps", type=int, default=0,
                     help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
@@ -154,7 +164,8 @@ def main():
     model = maybe_compile(model, args.compile, args.compile_mode)
 
     ds = ImageTextPairDataset(args.data_path, tokenizer, max_length=args.caption_len,
-                              vision_cfg=cfg.vision)
+                              vision_cfg=cfg.vision, source=args.source,
+                              image_size=args.image_size)
     # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
     # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
     if not args.steps and not args.epochs:
@@ -185,7 +196,11 @@ def main():
 
     # 只留视觉编码器（参考实现：丢弃 LLM，保留优化后的 ViT）
     torch.save(model.image.vit.state_dict(), os.path.join(args.save_dir, "vit_siglip.pth"))
-    print("SigLIP 对比预训练完成，已保存 vit_siglip.pth（仅视觉编码器）")
+    # 另存**完整双塔**（ViT + 投影头 + 文本塔 + 可学习温度/偏置）：参考实现只留 ViT，但保留
+    # 全模型才能对训好的编码器做**检索评测**（image→text 命中率），否则无从判断对比质量。
+    torch.save(model.state_dict(), os.path.join(args.save_dir, "siglip_full.pth"))
+    print("SigLIP 对比预训练完成，已保存 vit_siglip.pth（仅视觉编码器）"
+          "+ siglip_full.pth（完整双塔，供检索评测）")
 
 
 if __name__ == "__main__":

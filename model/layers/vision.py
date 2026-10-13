@@ -68,8 +68,8 @@ class PatchEmbed(nn.Module):
         self.proj = Linear(3 * vision_cfg.patch_size**2, vision_cfg.hidden_size, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x [n_patches, 3, ps, ps] → [n_patches, dim]。"""
-        return self.proj(x.flatten(1))
+        """x [..., n_patches, 3, ps, ps] → [..., n_patches, dim]（支持前置 batch 维）。"""
+        return self.proj(x.flatten(-3))
 
 
 class VisionAttention(nn.Module):
@@ -83,12 +83,19 @@ class VisionAttention(nn.Module):
         self.wo = Linear(vision_cfg.hidden_size, vision_cfg.hidden_size, bias=True)
 
     def forward(self, x, cos, sin):
-        n = x.size(0)
-        q, k, v = (t.view(n, self.n_heads, self.head_dim) for t in self.wqkv(x).chunk(3, dim=-1))
-        q = apply_rotary(q, cos, sin)
+        """x [..., n, dim]（前置 batch 维可选）；cos/sin [n, 1, d]。
+        输出：同 x 形状。预期行为：注意力在 n 维，batch 维广播。
+        """
+        lead = x.shape[:-2]                      # 前置 batch 维（单图时为空）
+        n = x.size(-2)
+        q, k, v = (t.view(*lead, n, self.n_heads, self.head_dim)
+                   for t in self.wqkv(x).chunk(3, dim=-1))   # [..., n, h, d]
+        q = apply_rotary(q, cos, sin)            # cos [n,1,d/2] 广播过 head 维
         k = apply_rotary(k, cos, sin)
-        o = F.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
-        return self.wo(o.transpose(0, 1).reshape(n, -1))
+        # SDPA 需 [..., h, n, d]：head 维换到 n 维之前（单图时即 transpose(0,1)）
+        o = F.scaled_dot_product_attention(q.transpose(-3, -2), k.transpose(-3, -2),
+                                           v.transpose(-3, -2))
+        return self.wo(o.transpose(-3, -2).reshape(*lead, n, -1))
 
 
 class VisionMLP(nn.Module):
