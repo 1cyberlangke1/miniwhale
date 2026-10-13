@@ -125,6 +125,8 @@ def main():
     ap = argparse.ArgumentParser(description="miniwhale 多模态训练")
     ap.add_argument("--data_path", default="dataset/sft_i2t.parquet")
     ap.add_argument("--ckpt", default=None, help="已训练的主干权重（可选）")
+    ap.add_argument("--vit_ckpt", default=None,
+                    help="第一阶段（SigLIP 对比）产出的视觉编码器权重（可选；按参考实现两阶段）")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--steps", type=int, default=1000, help="最多训练步数（0=跑满 epoch）")
     ap.add_argument("--seq_len", type=int, default=512)
@@ -158,6 +160,11 @@ def main():
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     if args.ckpt:
         model.load_state_dict(torch.load(args.ckpt, map_location=args.device), strict=False)
+    # 第二阶段从第一阶段（SigLIP 对比）的视觉编码器起（按参考实现：先对比预训练再自回归微调）
+    if args.vit_ckpt:
+        vit_state = torch.load(args.vit_ckpt, map_location=args.device)
+        model.vision.load_state_dict(vit_state)
+        print(f"已载入第一阶段视觉编码器 {args.vit_ckpt}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
     assert model.vision is not None, "模型未启用视觉塔"
 

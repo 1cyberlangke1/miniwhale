@@ -266,3 +266,65 @@ class MultimodalDataset(Dataset):
                 "labels": torch.tensor(labels),
                 "token_types": torch.tensor(token_types),
                 "images": images}
+
+
+class ImageTextPairDataset(Dataset):
+    """图文对数据集（SigLIP 对比预训练用，报告 §4.2.2 第一阶段）。
+
+    输入：parquet 路径（列 conversations + image_bytes）；tokenizer；max_length。
+    输出：{"patches": [n,3,p,p], "grid": (n_vit_h, n_vit_w), "text_ids": [L], "text_mask": [L]}。
+    预期行为：取首轮 user 文本（含 `<image>` 占位符）作 caption——去掉占位符后分词；
+              图像切成 ViT patch。无图或空 caption 的行返回 None（由 collate 过滤）。
+    """
+
+    def __init__(self, data_path: str | Path, tokenizer, max_length: int = 64,
+                 image_placeholder: str = "<image>", vision_cfg=None, row_group_size: int = 64):
+        import pyarrow.parquet as pq
+
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.image_placeholder = image_placeholder
+        self.vision_cfg = vision_cfg
+        self.path = str(data_path)
+        self.pf = pq.ParquetFile(self.path)
+        self.row_group_size = row_group_size
+
+    def __len__(self):
+        return self.pf.metadata.num_rows
+
+    def __getitem__(self, index):
+        import json
+
+        from model.image_processor import load_image_from_bytes
+
+        rg, offset = 0, index
+        while rg < self.pf.num_row_groups and offset >= self.pf.metadata.row_group(rg).num_rows:
+            offset -= self.pf.metadata.row_group(rg).num_rows
+            rg += 1
+        row = self.pf.read_row_group(rg).slice(offset, 1).to_pylist()[0]
+        raw = row.get("image_bytes")
+        if not raw:
+            return None
+        convs = row.get("conversations") or []
+        if isinstance(convs, str):
+            convs = json.loads(convs)
+        # 取首轮 user 文本当 caption（去掉图像占位符）
+        caption = ""
+        for c in convs:
+            if c.get("role") == "user":
+                caption = str(c.get("content", "")).replace(self.image_placeholder, "").strip()
+                break
+        if not caption:
+            return None
+        vc = self.vision_cfg
+        patches, n_vit_h, n_vit_w, _, _ = load_image_from_bytes(
+            raw, vc.patch_size, vc.downsample_ratio, vc.max_image_tokens,
+            vc.min_pixels, vc.max_wh_ratio)
+        ids = self.tokenizer(caption, add_special_tokens=False,
+                             max_length=self.max_length, truncation=True)["input_ids"]
+        pad = self.tokenizer.pad_token_id
+        text_ids = ids + [pad] * max(0, self.max_length - len(ids))
+        text_mask = [1] * len(ids) + [0] * max(0, self.max_length - len(ids))
+        return {"patches": patches, "grid": (n_vit_h, n_vit_w),
+                "text_ids": torch.tensor(text_ids[:self.max_length]),
+                "text_mask": torch.tensor(text_mask[:self.max_length], dtype=torch.bool)}

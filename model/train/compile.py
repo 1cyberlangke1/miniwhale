@@ -37,8 +37,16 @@ def maybe_compile(model: nn.Module, enabled: bool, mode: str = "default") -> nn.
     os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
     # AOTAutograd 层缓存（参考实现 Meta 实测占编译 13.5%）：缓存 autograd 图，
     # 跨进程复用。参考实现文档：`TORCHINDUCTOR_AUTOGRAD_CACHE` 需 `FX_GRAPH_CACHE` 才生效。
-    os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
     os.environ.setdefault("TORCHINDUCTOR_AUTOTUNE_LOCAL_CACHE", "1")
+    os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "1")
+    # SigLIP 对比阶段（双塔，非主干 Model）：文本塔逐层 + 图像塔的 ViT 逐块 compile。
+    # 图像塔逐图调用（patch 数随分辨率变化），故按 block 编译而非整个 ViT。
+    if not hasattr(model, "layers") and hasattr(model, "text") and hasattr(model, "image"):
+        for blk in model.text.blocks:
+            blk.forward = torch.compile(blk.forward, mode=mode)
+        for blk in model.image.vit.blocks:
+            blk.forward = torch.compile(blk.forward, mode=mode)
+        return model
     # 逐层 compile：每层独立成图；只替换 forward（不包成 OptimizedModule），
     # 以免 state_dict 键被加 `_orig_mod.` 前缀。Block.forward 是同一个 code object，
     # dynamo 按 code object 缓存，结构相同的层自动复用同一张编译产物。

@@ -103,7 +103,9 @@ class TextConfig:
 
     # DSpark
     num_nextn_predict_layers: int = 2
-    dspark_block_size: int = 3
+    # draft 位数：满血档 = 5（报告 §2.4.3「five draft positions」；参考实现部署配置
+    # num_speculative_tokens=5）。miniwhale 缩水为 4。
+    dspark_block_size: int = 4
     dspark_noise_token_id: int = 6199
     dspark_target_layer_ids: tuple = (6, 7)
     dspark_markov_rank: int = 64

@@ -102,7 +102,7 @@
     "engram_pad_token_id": 0,
     "engram_compressed_vocab_size": 5833,
     "num_nextn_predict_layers": 2,
-    "dspark_block_size": 3,
+    "dspark_block_size": 4,
     "dspark_noise_token_id": 6199,
     "dspark_target_layer_ids": [
       6,
