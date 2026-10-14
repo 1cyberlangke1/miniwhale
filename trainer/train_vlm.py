@@ -30,6 +30,7 @@ from model.train.data import MultimodalDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
+from model.train.logfile import setup_log_file
 from model.train.optim import make_optimizers, set_base_lr
 from model.tokenizer import load_tokenizer
 
@@ -129,7 +130,8 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
 
 def main():
     ap = argparse.ArgumentParser(description="miniwhale 多模态训练")
-    ap.add_argument("--data_path", default="dataset/sft_i2t_mini.parquet")
+    ap.add_argument("--data_path", default="dataset/sft_i2t_mini.parquet",
+                    help="纯图文 QA parquet（由 scripts/extract_i2t_mini.py 抽取）")
     ap.add_argument("--ckpt", default=None, help="已训练的主干权重（可选）")
     ap.add_argument("--vit_ckpt", default=None,
                     help="第一阶段（SigLIP 对比）产出的视觉编码器权重（可选；按参考实现两阶段）")
@@ -153,12 +155,18 @@ def main():
     ap.add_argument("--keep_last_n", type=int, default=3,
                     help="只保留最近 N 个 checkpoint（0=全留）")
     ap.add_argument("--save_dir", default="out")
+    ap.add_argument("--log_file", default=None,
+                    help="训练日志落盘路径（Python 内直写，不经 shell 管道；None=只打印控制台）")
     ap.add_argument("--compile", action="store_true",
                     help="用 torch.compile 加速训练（保持 inductor 默认数值语义）")
     ap.add_argument("--compile_mode", type=str, default="default",
                     help='torch.compile 模式（固定 "default"）')
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
+
+    # 日志落盘：**在 Python 里直写文件**（不经 shell 管道）——shell 的 `| grep` 会块缓冲，
+    # 导致 `flush=True` 的 print 也到不了文件（攒满 4KB 才吐）。
+    setup_log_file(args.log_file)
 
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
     # 见 train_pretrain 同名注释：bf16 参数会让 RMSNorm 权重的更新被舍入抹掉。

@@ -27,6 +27,7 @@ from model.train.data import SFTDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
+from model.train.logfile import setup_log_file
 from model.train.dspark_loss import compute_dspark_loss
 from model.train.optim import make_optimizers, set_base_lr
 from model.tokenizer import load_tokenizer
@@ -162,7 +163,10 @@ def main():
                         help='torch.compile 模式（固定 "default"）')
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--log_file", type=str, default=None,
+                        help="训练日志落盘路径（Python 内直写，不经 shell 管道；None=只打印控制台）")
     args = parser.parse_args()
+    setup_log_file(args.log_file)
 
     torch.manual_seed(args.seed)
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。

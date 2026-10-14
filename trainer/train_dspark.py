@@ -35,6 +35,7 @@ from model.train.data import PretrainDataset
 from model.train.dspark_loss import compute_dspark_loss
 from model.model import Model
 from model.train.compile import maybe_compile
+from model.train.logfile import setup_log_file
 from model.tokenizer import load_tokenizer
 
 
@@ -91,12 +92,15 @@ def main():
     ap.add_argument("--keep_last_n", type=int, default=3,
                     help="只保留最近 N 个 checkpoint（0=全留）")
     ap.add_argument("--save_dir", default="out")
+    ap.add_argument("--log_file", default=None,
+                    help="训练日志落盘路径（Python 内直写，不经 shell 管道；None=只打印控制台）")
     ap.add_argument("--compile", action="store_true",
                     help="用 torch.compile 加速训练（保持 inductor 默认数值语义）")
     ap.add_argument("--compile_mode", type=str, default="default",
                     help='torch.compile 模式（固定 "default"）')
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
+    setup_log_file(args.log_file)
 
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
     # 见 train_pretrain 同名注释：bf16 参数会让 RMSNorm 权重的更新被舍入抹掉。

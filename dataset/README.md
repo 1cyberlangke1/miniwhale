@@ -17,19 +17,25 @@
 - **格式**：`jsonl`。预训练每行 `{"text": "..."}`；SFT 为多轮对话。
 - **说明**：`*_mini` 是轻量版（推荐 `max_seq_len≈768`），本机 8GB 用 mini 版。
 
-## 2. 图文对数据（多模态 SFT）
+## 2. 图文对数据（多模态：ViT 自回归微调 / 后续混合 SFT）
 
 | 文件 | 用途 | 阶段 |
 |---|---|---|
-| `sft_i2t.parquet` / `sft_i2t_mini.parquet` | 多模态 SFT | 3 / 5 |
+| `sft_i2t.parquet` | 完整版图文 QA | 3（可换） |
+| `sft_i2t_mini.parquet` | **纯图文** mini 子集（本机用） | 3 |
 
-- **来源**：MiniMind-V 项目；原始图文来自 **ALLaVA-4V** 系列（LAION + VFLAN 子集，中英双语）
+- **来源**：MiniMind-V 项目；原始图文来自 **ALLAVA-4V** 系列（LAION + VFLAN 子集，中英双语）
   - HuggingFace：<https://huggingface.co/datasets/jingyaogong/minimind-v_dataset>
   - ModelScope：<https://www.modelscope.cn/datasets/gongjy/minimind-v_dataset>
 - **格式**：`parquet`，列 `conversations`(json 字符串) + `image_bytes`(binary)。
   图像统一 resize 到 256×256 后编码为 JPEG。
-- **规模**：完整版约 290 万条（约 65 万张唯一图像），Pretrain 已作为子集并入。
-- **备注**：这是 **VQA 指令格式**（user 段是问题、assistant 段是描述），适合 SFT，
+- **完整版构成**（2,904,511 行，实测）：**92.07% 图文**（2,674,248 行，含 `<image>` 占位符）
+  + **7.93% 纯文本**（230,263 行，图像列填 8×8 黑图占位、**无** `<image>` 占位符，用于保留基础语言能力）。
+- **`sft_i2t_mini.parquet`**：从完整版抽取的 **905,818 行纯图文子集**（按比例随机抽样、
+  剔除全部纯文本占位行，含 `<image>` 占 100%）。抽取脚本见 `scripts/`。
+- **为什么 mini 只留纯图文**：本项目的多模态阶段拆成「ViT 自回归微调（纯图文）→ 混合 SFT
+  （图文 + 纯文本）」两步，各自负责视觉对齐 / 语言保留；故 ViT 阶段的数据必须无纯文本干扰。
+- **备注**：这是 **VQA 指令格式**（user 段是问题、assistant 段是描述），适合指令微调，
   **不适合**直接做 SigLIP 对比学习（对比学习要「图 ↔ 描述」的纯图文对，见下）。
 
 ## 3. Flickr30k（ViT 对比预训练）

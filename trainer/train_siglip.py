@@ -29,6 +29,7 @@ from model.config import ModelConfig
 from model.train.data import ImageTextPairDataset, PreprocessedPairDataset
 from model.train.siglip import SigLIP
 from model.train.compile import maybe_compile
+from model.train.logfile import setup_log_file
 from model.train.optim import make_optimizers, set_base_lr
 from model.tokenizer import load_tokenizer
 
@@ -168,7 +169,10 @@ def main():
     ap.add_argument("--compile_mode", type=str, default="default",
                     help='torch.compile 模式（固定 "default"）')
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--log_file", default=None,
+                    help="训练日志落盘路径（Python 内直写，不经 shell 管道；None=只打印控制台）")
     args = ap.parse_args()
+    setup_log_file(args.log_file)
 
     # 参数保持 fp32 主权重；计算走 bf16 autocast（同其它训练入口）。
     tokenizer = load_tokenizer()

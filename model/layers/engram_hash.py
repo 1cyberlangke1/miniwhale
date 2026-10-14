@@ -143,14 +143,21 @@ class EngramHash(nn.Module):
         if token_mask is not None:
             compressed = torch.where(token_mask, compressed, torch.full_like(compressed, DEAD))
 
-        positions = torch.arange(L, device=input_ids.device).expand(b, L)
-        tokens, blocked = [], torch.zeros_like(positions, dtype=torch.bool)
-        for shift in range(self.max_ngram_size):
-            src_pos = positions - shift
-            source = compressed.gather(1, src_pos.clamp_min(0))
-            blocked = blocked | (src_pos < 0) | (source == DEAD)
-            tokens.append(torch.where(blocked, self.pad_id, source))
-        tokens = torch.stack(tokens, dim=-1)  # [B, L, max_ngram]
+        # 向量化（等价替换原先的 shift 循环）：一次性建 [1,L,M] 的偏移索引，
+        # 沿 L 维一次 gather 出全部回看位，再对「越界 / DEAD」做**累积 OR** 得到屏蔽位。
+        # 原循环里 `blocked = blocked | ...` 逐 shift 累积，等价于对 bad 做前缀 OR；
+        # 每步 tokens[shift] = where(blocked_shift, pad, source_shift)，故此处直接得到
+        # 同形状 [B,L,M] 的 tokens（m 维顺序与原来 stack 一致：m=0 为最近位）。
+        M = self.max_ngram_size
+        positions = torch.arange(L, device=input_ids.device).view(1, L, 1)   # [1, L, 1]
+        shifts = torch.arange(M, device=input_ids.device).view(1, 1, M)      # [1, 1, M]
+        src_pos = positions - shifts                                         # [1, L, M]
+        # source[b,l,m] = compressed[b, clamp(src_pos[l,m])]：expand 出 [B,L,M] 后沿 L 维 gather
+        source = compressed.unsqueeze(-1).expand(b, L, M).gather(
+            1, src_pos.expand(b, L, M).clamp_min(0))
+        bad = (src_pos < 0) | (source == DEAD)                               # [B, L, M]
+        blocked = bad.int().cumsum(dim=-1) > 0                               # 前缀 OR
+        tokens = torch.where(blocked, self.pad_id, source)                   # [B, L, M]
 
         products = tokens.unsqueeze(2) * self.multipliers  # [B, L, layers, max_ngram]
         rolling, hashes = products[..., 0], []

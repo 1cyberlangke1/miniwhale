@@ -21,7 +21,9 @@ python -m venv .venv
 
 # 数据（放到 dataset/）
 #   pretrain_t2t_mini.jsonl / sft_t2t_mini.jsonl（文本）
-#   sft_i2t.parquet（多模态，含 pretrain 子集）
+#   sft_i2t_mini.parquet（纯图文，供 ViT 自回归微调）
+#   从完整版 sft_i2t.parquet 抽纯图文子集（剔除约 8% 纯文本占位行）：
+#   python scripts/extract_i2t_mini.py
 
 # 预训练
 .venv/Scripts/python trainer/train_pretrain.py --data_path dataset/pretrain_t2t_mini.jsonl
@@ -35,8 +37,8 @@ python -m venv .venv
 # DSpark 二阶段（冻结 backbone）
 .venv/Scripts/python trainer/train_dspark.py --ckpt out/pEngram.pth
 
-# 多模态
-.venv/Scripts/python trainer/train_vlm.py --data_path dataset/sft_i2t.parquet
+# 多模态（ViT 自回归微调，纯图文）
+.venv/Scripts/python trainer/train_vlm.py --data_path dataset/sft_i2t_mini.parquet
 ```
 
 ## 结构

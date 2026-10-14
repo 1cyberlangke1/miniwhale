@@ -9,10 +9,40 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
+
+
+def render_chat(tokenizer, conversations, *, max_length=None, truncation=False):
+    """用 chat template 渲染多轮对话，**保留工具调用能力**（照 minimind 的 create_chat_prompt）。
+
+    输入：tokenizer；conversations（list[dict]，键可能含 role/content/reasoning_content/
+          tools/tool_calls）；max_length（None=不截断）；truncation。
+    输出：input_ids（list[int]）。
+    预期行为：把 system 消息里的 `tools`（字符串或对象）解析出来，作为**独立参数** `tools=`
+              传给模板（模板靠它渲染 `# Tools` 段）；把消息里的 `tool_calls` 字符串解析回对象。
+              保留消息原有全部键（reasoning_content / tool_calls 等），模板才认得。
+              只做「字符串→对象」的解析，不丢弃任何字段——丢弃会阉割工具调用能力。
+    """
+    tools = None
+    messages = []
+    for m in conversations:
+        m = dict(m)
+        if m.get("role") == "system" and m.get("tools"):
+            tools = json.loads(m["tools"]) if isinstance(m["tools"], str) else m["tools"]
+        if m.get("tool_calls") and isinstance(m["tool_calls"], str):
+            m["tool_calls"] = json.loads(m["tool_calls"])
+        messages.append(m)
+    out = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=False,
+        tools=tools, max_length=max_length, truncation=truncation)
+    ids = out["input_ids"] if hasattr(out, "keys") else out
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return list(ids)
 
 
 class PretrainDataset(IterableDataset):
@@ -144,15 +174,11 @@ class SFTDataset(IterableDataset):
 
     def _encode(self, row):
         convs = row.get("conversations", []) or []
-        # 只保留模板认识的字段，避免多余键报错
-        convs = [{"role": c["role"], "content": c["content"]} for c in convs]
-        out = self.tokenizer.apply_chat_template(
-            convs, tokenize=True, add_generation_prompt=False,
-            max_length=self.max_length, truncation=True,
-        )
-        ids = out["input_ids"] if hasattr(out, "keys") else out
-        if ids and isinstance(ids[0], list):
-            ids = ids[0]
+        if isinstance(convs, str):
+            convs = json.loads(convs)
+        # 保留 tools / tool_calls / reasoning_content（render_chat 解析，不丢字段）
+        ids = render_chat(self.tokenizer, convs,
+                          max_length=self.max_length, truncation=True)
         labels = self.generate_labels(ids)
         pad = self.tokenizer.pad_token_id
         input_ids = list(ids) + [pad] * (self.max_length - len(ids))
@@ -273,19 +299,14 @@ class MultimodalDataset(IterableDataset):
         if isinstance(convs, str):
             convs = json.loads(convs)
         raw = row.get("image_bytes")
-        # 有图：把 `<image>` 换成 image_token 占位（一个），随后由 _image_inputs 展开成 span
+        # 有图：把 `<image>` 换成 image_token 占位（一个），随后由 _image_inputs 展开成 span。
+        # 只替换 content，保留 tools / tool_calls 等键（render_chat 会解析）。
         if raw:
-            convs = [{"role": c["role"],
-                      "content": str(c["content"]).replace(
-                          self.image_placeholder, self.tokenizer.decode([self.image_token_id]))}
-                     for c in convs]
-        out = self.tokenizer.apply_chat_template(
-            convs, tokenize=True, add_generation_prompt=False,
-            max_length=self.max_length, truncation=True)
-        ids = out["input_ids"] if hasattr(out, "keys") else out
-        if ids and isinstance(ids[0], list):
-            ids = ids[0]
-        ids = list(ids)
+            convs = [{**c, "content": str(c.get("content", "")).replace(
+                self.image_placeholder, self.tokenizer.decode([self.image_token_id]))}
+                for c in convs]
+        ids = render_chat(self.tokenizer, convs,
+                          max_length=self.max_length, truncation=True)
 
         token_types = [(-1)] * len(ids)
         images = []
@@ -434,8 +455,9 @@ class PreprocessedPairDataset(IterableDataset):
           shuffle（True=每 epoch 打乱图序，默认）。
     输出（迭代）：{"patches": [n,3,p,p](bf16), "grid": (n_h,n_w), "text_ids": [L], "text_mask": [L]}。
     预期行为：patches 以 uint16 位模式存 memmap，`.view(torch.bfloat16)` 零拷贝还原；
-              每张图（=一行）随机取一条 caption 当正样本（同图多描述会互成假负例，
-              故每行只出一个样本，多 caption 通过多 epoch 轮换覆盖）。
+              **每张图的全部 num_captions 条描述都出样本**（不浪费数据）；样本打乱后
+              同图的多条描述天然分散到不同 batch，偶然同 batch 时按参考实现 sigmoid loss
+              当作普通负样本（参考实现对 label noise 鲁棒，且占比极小）。
               num_workers>0 时各 worker 按下标取模切分，互不重叠。
     """
 
@@ -456,10 +478,10 @@ class PreprocessedPairDataset(IterableDataset):
         # __iter__ 里由**每个 worker 自己**惰性打开。
 
     def __len__(self):
-        return self.total
+        return self.total * self.num_captions
 
     def set_epoch(self, epoch: int):
-        """每 epoch 前调用：换随机种子，图序与 caption 选择都随之变化。"""
+        """每 epoch 前调用：换随机种子，样本顺序随之变化。"""
         self.epoch = epoch
 
     def __iter__(self):
@@ -471,15 +493,14 @@ class PreprocessedPairDataset(IterableDataset):
         patches = np.load(Path(self.dir, "patches.npy"), mmap_mode="r")
         caps = np.load(Path(self.dir, "captions.npy"), mmap_mode="r")
         cmask = np.load(Path(self.dir, "caption_mask.npy"), mmap_mode="r")
-        order = list(range(self.total))
+        # 展开成 (图 i, 描述 k) 全部样本对，再打乱（同图的描述分散到不同 batch）。
+        pairs = [(i, k) for i in range(self.total) for k in range(self.num_captions)]
         if self.shuffle:
-            random.Random(self.seed + self.epoch).shuffle(order)
+            random.Random(self.seed + self.epoch).shuffle(pairs)
         wi = get_worker_info()
         if wi is not None:                      # 多 worker：按下标取模切分，互不重叠
-            order = order[wi.id::wi.num_workers]
-        for i in order:
-            # 每张图（=一行）随机取一条 caption（同图多描述会互成假负例，故每行只出一个样本）
-            k = random.Random(self.seed + self.epoch * 1000003 + i).randrange(self.num_captions)
+            pairs = pairs[wi.id::wi.num_workers]
+        for i, k in pairs:
             # uint16 memmap → bf16 张量：.copy() 保证可写连续（from_numpy 视图不能 view）
             yield {"patches": torch.from_numpy(patches[i].copy()).view(torch.bfloat16),
                    "grid": self.grid,

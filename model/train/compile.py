@@ -31,6 +31,10 @@ def maybe_compile(model: nn.Module, enabled: bool, mode: str = "default") -> nn.
     """
     if not enabled:
         return model
+    # 每层 Block 的整数/布尔属性（compress_ratio、is_kv_source、is_index_source …）各不相同，
+    # 8 层共享同一 forward code object 但按属性值特化 → 触发多次重编译；默认 recompile_limit=8
+    # 会撞上限并回退 eager（稳态变慢）。提高上限让各特化都真编译（一次性成本），稳态走编译图。
+    torch._dynamo.config.recompile_limit = 64
     # 跨进程编译缓存：FX 图编译产物 + autotune 结果落盘（%TEMP%/torchinductor_*/），
     # 第二次启动直接命中，参考实现称 warm 编译可省 90%+ 时间（冷启动才是几分钟的元凶）。
     # 缓存 key 含输入 shape —— 训练 batch/seq 固定即可稳定命中。
@@ -55,4 +59,45 @@ def maybe_compile(model: nn.Module, enabled: bool, mode: str = "default") -> nn.
     # dynamo 按 code object 缓存，结构相同的层自动复用同一张编译产物。
     for layer in model.layers:
         layer.forward = torch.compile(layer.forward, mode=mode)
+        # Engram 挂在 Block 上，但**在 Model.forward 里被调用**（不在 Block.forward 内），
+        # 故编 Block.forward 覆盖不到它 → 单独编译（否则每层 Engram 全走 eager）。
+        if getattr(layer, "engram", None) is not None:
+            layer.engram.forward = torch.compile(layer.engram.forward, mode=mode)
+    # 视觉塔（ViT 的 N 个 block）与 Aligner 单独 compile：它们形状规则可编，
+    # 但 patch 数随图像分辨率变 → dynamic=True，避免每遇新形状重编译。
+    # （主干 Model.forward 的 merge_image_embeddings 是按图像个数的 Python 循环，
+    #   不在此编译——模块级逐块编译已覆盖其内部全部可编算子。）
+    vision = getattr(model, "vision", None)
+    if vision is not None:
+        for blk in vision.blocks:
+            blk.forward = torch.compile(blk.forward, mode=mode, dynamic=True)
+    aligner = getattr(model, "aligner", None)
+    if aligner is not None:
+        aligner.forward = torch.compile(aligner.forward, mode=mode, dynamic=True)
+    # DSpark drafter 的 block（`mtp` 是 nn.ModuleList of DSparkBlock，与主干 Block 同级）。
+    # 训练走 forward_train（teacher-forced 并行路径），故编它而不是 forward。
+    # 阶段 3 不调用 dspark，此处只是预先编好供阶段 4 用；编 Block 本身形状规则、无循环。
+    dspark = getattr(model, "dspark", None)
+    if dspark is not None:
+        for blk in dspark.mtp:
+            blk.forward_train = torch.compile(blk.forward_train, mode=mode)
+    # EngramHash：每步一次的整数 n-gram 哈希（gather/where/stack/xor/%/cat），
+    # 是一串小算子 → 编译融合成少量 kernel。形状 [B,L] 固定，静态编译。
+    engram_hash = getattr(model, "engram_hash", None)
+    if engram_hash is not None:
+        engram_hash.forward = torch.compile(engram_hash.forward, mode=mode)
+    # 主干顶层叶子模块：embed / norm / head。Model.forward 本身含**变长图像循环**
+    # （每样本图像数不定）故不整体编译；但这三个叶子形状规则、无循环，且 head 是
+    # 全序列 fp32 GEMM（[B,L,V]，V=6400）——逐模块编译可把其前后的 cast 一并交给
+    # inductor 融合（profiler 里 eager 的 aten::to/copy_/mul 主要来自这些未编区域）。
+    for name in ("embed", "norm", "head"):
+        leaf = getattr(model, name, None)
+        if leaf is not None:
+            leaf.forward = torch.compile(leaf.forward, mode=mode)
+    # 视觉塔的 patch_embed（线性投影）与末端 norm：blocks 已逐块编译，这两处仍是
+    # eager。patch 数随分辨率变 → dynamic=True，避免每遇新网格重编译。
+    vision = getattr(model, "vision", None)
+    if vision is not None:
+        vision.patch_embed.forward = torch.compile(vision.patch_embed.forward, mode=mode, dynamic=True)
+        vision.norm.forward = torch.compile(vision.norm.forward, mode=mode, dynamic=True)
     return model

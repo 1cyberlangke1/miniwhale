@@ -248,13 +248,15 @@ class Attention(nn.Module):
         T = kv.size(1)
         K = idxs.size(-1)
         qf = q.float()
-        kf = kv.float()
         # gather KV: [B,L,K,D]。用沿 T 维的 gather（index 直接是 [B,L*K]），**不造**
         # [B,L,T,D] 中间张量——后者在 L=1024/T=1152 时是 6 亿元素（fwd+bwd 爆显存）。
         # gather 是纯复制无算术，与旧写法逐位一致。
+        # 等价改写：先在 **kv 的原 dtype（bf16）** 上 gather，再 `.float()`。dtype cast 是逐元素、
+        # 与 gather（纯复制）可交换，故数值逐位相同；但中间张量从 fp32 [B,L,K,D] 减半为 bf16，
+        # 拷贝量减半（profiler 里 copy_ 是大头）。
         valid = idxs >= 0
         safe = idxs.clamp_min(0)
-        k_sel = kf.gather(1, safe.reshape(b, L * K, 1).expand(b, L * K, D)).reshape(b, L, K, D)
+        k_sel = kv.gather(1, safe.reshape(b, L * K, 1).expand(b, L * K, D)).reshape(b, L, K, D).float()
         # QK^T：bf16 输入、fp32 累加（此处输入已是 bf16 上转的 fp32，等价 fp32 累加）
         scores = torch.einsum("blhd,blkd->blhk", qf, k_sel) * self.softmax_scale
         scores = scores.masked_fill(~valid.unsqueeze(2), -torch.inf)
