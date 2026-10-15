@@ -18,8 +18,10 @@ import time
 from pathlib import Path
 
 # **必须在 import torch 之前**设（torch._inductor.config 首次 import 时读 env）。
-# compile_threads=1：Windows 上多线程编译会走 SubprocPool 的 pass_fds → CPython 断言崩溃。
-os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+# compile_threads=1：**仅 Windows**——多线程编译会走 SubprocPool 的 pass_fds → CPython
+# 断言崩溃。Linux（含 Kaggle）放开多线程，编译更快。
+if sys.platform == "win32":
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
 import torch
 from torch.utils.data import DataLoader
@@ -27,6 +29,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
+from model.train import ddp
 from model.train.data import ImageTextPairDataset, PreprocessedPairDataset
 from model.train.siglip import SigLIP
 from model.train.compile import maybe_compile
@@ -83,12 +86,23 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
-    for step, batch in enumerate(loader):
-        if max_steps is not None and step >= max_steps:
+    # DDP 防死锁：各 rank 数据量可能不等，先耗尽者若退出循环会让其余 rank 卡在 all_reduce。
+    # 数据耗尽时重启迭代器继续，由 max_steps 统一步数（非分布式行为不变）。
+    it = iter(loader)
+    while True:
+        try:
+            batch = next(it)
+        except StopIteration:
+            if max_steps is None or steps >= max_steps:
+                break
+            it = iter(loader)
+            batch = next(it)
+        if max_steps is not None and steps >= max_steps:
             break
         # 对比损失需要 batch 内至少 2 个样本（1×1 的 logits 退化）
         if batch is None or batch["text_ids"].size(0) < 2:
             continue
+        step = steps
         gstep = start_step + step          # **全局**步数：lr 调度与 checkpoint 都按它算
         t_step0 = time.time()
         lr = get_lr(gstep, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
@@ -98,6 +112,10 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         patches = [p.to(args.device) for p in batch["patches"]]
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits = model(patches, batch["grid"], text_ids, text_mask)
+            # **DDP 注意**：SigLIP 对比损失是**卡内**对比（正负样本都在本卡 batch 内）。
+            # 多卡下各卡独立算对比 → 与单卡大 batch 的对比**不等价**（负样本集不同）。
+            # 要做到等价须 all_gather 各卡特征再算全局对比（另一处改动）。SigLIP 阶段
+            # 已完成、不再重跑，故此处仅保证 DDP 能跑，数值语义差异**已知且未修**。
             loss = SigLIP.loss(logits) / args.accumulation_steps
         loss.backward()
         if (gstep + 1) % args.accumulation_steps == 0:
@@ -106,17 +124,17 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
             muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad()
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
-        if gstep % args.log_interval == 0:
-            # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度
+        if gstep % args.log_interval == 0 and ddp.is_main():
+            # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度。仅 rank0 打印。
             now = time.time()
             print(f"epoch {epoch} step {gstep} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
                   f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
             t_step0 = now
-        if args.save_interval and (gstep + 1) % args.save_interval == 0:
+        if args.save_interval and (gstep + 1) % args.save_interval == 0 and ddp.is_main():
             os.makedirs(args.save_dir, exist_ok=True)
             torch.save({
-                "model": model.state_dict(),
+                "model": ddp.unwrap(model).state_dict(),
                 "muon": muon.state_dict(),
                 "adamw": adamw.state_dict(),
                 "sinkhorn": sinkhorn.state_dict(),
@@ -183,7 +201,10 @@ def main():
     ap.add_argument("--log_file", default=None,
                     help="训练日志落盘路径（Python 内直写，不经 shell 管道；None=只打印控制台）")
     args = ap.parse_args()
-    setup_log_file(args.log_file)
+    # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
+    args.device = ddp.setup(args.device)
+    if ddp.is_main():
+        setup_log_file(args.log_file)
 
     # 参数保持 fp32 主权重；计算走 bf16 autocast（同其它训练入口）。
     tokenizer = load_tokenizer()
@@ -242,23 +263,38 @@ def main():
         adamw.load_state_dict(resume_ck["adamw"])
         sinkhorn.load_state_dict(resume_ck["sinkhorn"])
         print("已恢复三优化器状态（Muon/AdamW/Sinkhorn 动量）", flush=True)
+    # DDP 包装：**必须在 make_optimizers 之后**（否则 named_parameters 带 `module.` 前缀
+    # → 按名路由的优化器分组失效）。
+    model = ddp.wrap(model)
+
     os.makedirs(args.save_dir, exist_ok=True)
     global_step = start_step
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮重排 shard 顺序 + shuffle buffer
+        # DDP 下各 rank 数据量可能不等 → 固定步数（否则先耗尽者退出循环致 all_reduce 死锁）。
+        ep_steps = max_steps
+        if ddp.is_distributed() and ep_steps is None:
+            ep_steps = max(len(ds) // args.batch_size // ddp.world_size(), 1)
         loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
-                              start_step=global_step, max_steps=max_steps)
+                              start_step=global_step, max_steps=ep_steps)
         global_step += n   # 跨 epoch 累加：lr 余弦调度与 checkpoint 间隔都按全局步数
-        print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {global_step} 步）")
+        if ddp.is_main():
+            print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {global_step} 步）")
 
-    # 只留视觉编码器（参考实现：丢弃 LLM，保留优化后的 ViT）
-    torch.save(model.image.vit.state_dict(), os.path.join(args.save_dir, "vit_siglip.pth"))
-    # 另存**完整双塔**（ViT + 投影头 + 文本塔 + 可学习温度/偏置）：参考实现只留 ViT，但保留
-    # 全模型才能对训好的编码器做**检索评测**（image→text 命中率），否则无从判断对比质量。
-    torch.save(model.state_dict(), os.path.join(args.save_dir, "siglip_full.pth"))
-    print("SigLIP 对比预训练完成，已保存 vit_siglip.pth（仅视觉编码器）"
-          "+ siglip_full.pth（完整双塔，供检索评测）")
+    # 存盘只用 rank0，且 unwrap 去 `module.` 前缀（与单卡兼容）。
+    if ddp.is_main():
+        raw = ddp.unwrap(model)
+        # 只留视觉编码器（参考实现：丢弃 LLM，保留优化后的 ViT）
+        torch.save(raw.image.vit.state_dict(), os.path.join(args.save_dir, "vit_siglip.pth"))
+        # 另存**完整双塔**（ViT + 投影头 + 文本塔 + 可学习温度/偏置）：参考实现只留 ViT，但保留
+        # 全模型才能对训好的编码器做**检索评测**（image→text 命中率），否则无从判断对比质量。
+        torch.save(raw.state_dict(), os.path.join(args.save_dir, "siglip_full.pth"))
+        print("SigLIP 对比预训练完成，已保存 vit_siglip.pth（仅视觉编码器）"
+              "+ siglip_full.pth（完整双塔，供检索评测）")
+    ddp.barrier()
+    ddp.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    # 多进程启动：单卡时直接跑；多卡时 spawn（notebook / 无 torchrun 环境也能用）。
+    ddp.launch(main)

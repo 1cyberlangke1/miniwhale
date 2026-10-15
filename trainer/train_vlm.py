@@ -18,8 +18,10 @@ import time
 from pathlib import Path
 
 # **必须在 import torch 之前**设（torch._inductor.config 首次 import 时读 env）。
-# compile_threads=1：Windows 上多线程编译会走 SubprocPool 的 pass_fds → CPython 断言崩溃。
-os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+# compile_threads=1：**仅 Windows**——多线程编译会走 SubprocPool 的 pass_fds → CPython
+# 断言崩溃。Linux（含 Kaggle）放开多线程，编译更快。
+if sys.platform == "win32":
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
 import torch
 from torch.utils.data import DataLoader
@@ -27,6 +29,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
+from model.train import ddp
 from model.train.data import MultimodalDataset, PreprocessedVLDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
@@ -78,9 +81,21 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
-    for step, batch in enumerate(loader):
-        if max_steps is not None and step >= max_steps:
+    # DDP 防死锁：各 rank 分到的数据量可能不等（HF shard 切分不按行），若某 rank 先耗尽
+    # 而退出循环，其它 rank 会卡在 all_reduce 上永久阻塞。故数据耗尽时**重启迭代器**继续，
+    # 由 max_steps 统一步数。非分布式下 this 行为与原来一致（不重启，跑到 loader 结束）。
+    it = iter(loader)
+    while True:
+        try:
+            batch = next(it)
+        except StopIteration:
+            if max_steps is None or steps >= max_steps:
+                break
+            it = iter(loader)          # 分布式：重头再来，凑齐步数（不退出）
+            batch = next(it)
+        if max_steps is not None and steps >= max_steps:
             break
+        step = steps
         gstep = start_step + step          # **全局**步数：lr 调度与 checkpoint 都按它算
         t_step0 = time.time()
         # 只更新基准 lr，各组按 lr_mult 缩放（保留 Engram ×5，参考实现 §4.2.2）
@@ -93,34 +108,39 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         images = batch["images"] if any(batch["images"]) else None
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits, _ = model(ids, images=images, token_types=token_types)
-            loss = torch.nn.functional.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)),
-                labels[:, 1:].reshape(-1), ignore_index=-100)
-            loss = loss / args.accumulation_steps
+            # **全局 token 归一化**（DDP 逐位等价的关键）：单卡时 = 批内 mean（数值不变）；
+            # 多卡时各卡算 sum、按全局 valid token 数归一 → DDP 平均梯度后恰好等于
+            # 单卡 batch=world_size*B 的全局 mean。直接用批内 mean 会因各卡 token 数不同而不等价。
+            tgt = labels[:, 1:].reshape(-1)
+            ce_sum = torch.nn.functional.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.size(-1)), tgt,
+                ignore_index=-100, reduction="sum")
+            n_valid = (tgt != -100).sum()
+            loss = ddp.scale_loss_for_ddp(ce_sum, n_valid) / args.accumulation_steps
         IndexerLossAutoScaler.set_loss_scale(loss.detach())
         loss.backward()
         if (gstep + 1) % args.accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             muon.step(); adamw.step(); sinkhorn.step()
             muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad()
-            model.update_router_bias(args.router_bias_rate)
+            ddp.unwrap(model).update_router_bias(args.router_bias_rate)
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
-        if gstep % args.log_interval == 0:
-            # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度
+        if gstep % args.log_interval == 0 and ddp.is_main():
+            # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度。仅 rank0 打印。
             now = time.time()
             print(f"epoch {epoch} step {gstep} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
                   f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
             t_step0 = now
-        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
-        if args.save_interval and (gstep + 1) % args.save_interval == 0:
+        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**，避免多进程争抢。
+        if args.save_interval and (gstep + 1) % args.save_interval == 0 and ddp.is_main():
             os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"vlm_e{epoch}_s{gstep+1}.pth")
             # 存**完整训练状态**（模型 + 三优化器动量 + 步数），续训才能无缝接上；
-            # 只存权重会让优化器动量归零（失忆）。
+            # 只存权重会让优化器动量归零（失忆）。unwarp 去 `module.` 前缀，与单卡兼容。
             torch.save({
-                "model": model.state_dict(),
+                "model": ddp.unwrap(model).state_dict(),
                 "muon": muon.state_dict(),
                 "adamw": adamw.state_dict(),
                 "sinkhorn": sinkhorn.state_dict(),
@@ -184,9 +204,13 @@ def main():
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
+    # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
+    args.device = ddp.setup(args.device)
     # 日志落盘：**在 Python 里直写文件**（不经 shell 管道）——shell 的 `| grep` 会块缓冲，
     # 导致 `flush=True` 的 print 也到不了文件（攒满 4KB 才吐）。
-    setup_log_file(args.log_file)
+    # 分布式下只有 rank0 写日志，避免多进程争抢同一文件。
+    if ddp.is_main():
+        setup_log_file(args.log_file)
 
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
     # 见 train_pretrain 同名注释：bf16 参数会让 RMSNorm 权重的更新被舍入抹掉。
@@ -229,6 +253,9 @@ def main():
         print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
     assert model.vision is not None, "模型未启用视觉塔"
+    # **DDP 包装不在此处**：必须在 make_optimizers **之后**。DDP 包装会让
+    # named_parameters() 带 `module.` 前缀 → make_optimizers 的按名路由（Muon/AdamW/
+    # Sinkhorn 分组）会失效。故先建优化器（此时 model 未包），再包 DDP（见下方）。
 
     if args.pre_dir:
         # 离线预处理路径：零现场 PIL 解码，num_workers>0 真生效（memmap 下标取模切分）
@@ -266,20 +293,37 @@ def main():
         sinkhorn.load_state_dict(resume_ck["sinkhorn"])
         print("已恢复三优化器状态（Muon/AdamW/Sinkhorn 动量）", flush=True)
 
+    # DDP 包装：**必须在 make_optimizers 之后**（否则 named_parameters 带 `module.`
+    # 前缀 → 按名路由的优化器分组失效）。find_unused_parameters=True：MoE 每步有未激活
+    # 专家，须允许部分参数不参与梯度。
+    model = ddp.wrap(model)
+
     os.makedirs(args.save_dir, exist_ok=True)
     global_step = start_step
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮重排 shard 顺序 + shuffle buffer
+        # DDP 下各 rank 数据量可能不等 → 必须用固定步数（否则先耗尽的 rank 退出循环，
+        # 其余卡在 all_reduce 死锁）。按「本 rank 数据量 // world_size」估步数，取整保守。
+        ep_steps = max_steps
+        if ddp.is_distributed() and ep_steps is None:
+            ep_steps = max(len(ds) // args.batch_size // ddp.world_size(), 1)
         loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
-                              start_step=global_step, max_steps=max_steps)
+                              start_step=global_step, max_steps=ep_steps)
         global_step += n   # 跨 epoch 累加：lr 余弦调度与 checkpoint 间隔都按全局步数
-        print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {global_step} 步）")
+        if ddp.is_main():
+            print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {global_step} 步）")
 
-    torch.save(model.state_dict(), os.path.join(args.save_dir, "vlm.pth"))
-    # ViT 自回归微调阶段（报告 §4.2.2 阶段二）：只保留优化后的视觉编码器，丢弃 LLM
-    torch.save(model.vision.state_dict(), os.path.join(args.save_dir, "vit_ar.pth"))
-    print("多模态训练完成，已保存 vlm.pth + vit_ar.pth（仅视觉编码器）")
+    # 存盘只用 rank0；且必须 unwrap（否则 state_dict 键带 `module.` 前缀，与单卡不兼容）。
+    if ddp.is_main():
+        raw = ddp.unwrap(model)
+        torch.save(raw.state_dict(), os.path.join(args.save_dir, "vlm.pth"))
+        # ViT 自回归微调阶段（报告 §4.2.2 阶段二）：只保留优化后的视觉编码器，丢弃 LLM
+        torch.save(raw.vision.state_dict(), os.path.join(args.save_dir, "vit_ar.pth"))
+        print("多模态训练完成，已保存 vlm.pth + vit_ar.pth（仅视觉编码器）")
+    ddp.barrier()
+    ddp.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    # 多进程启动：单卡时直接跑；多卡时 spawn（notebook / 无 torchrun 环境也能用）。
+    ddp.launch(main)

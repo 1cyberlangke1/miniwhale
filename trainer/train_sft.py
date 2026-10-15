@@ -15,8 +15,10 @@ import time
 from pathlib import Path
 
 # **必须在 import torch 之前**设（torch._inductor.config 首次 import 时读 env）。
-# compile_threads=1：Windows 上多线程编译会走 SubprocPool 的 pass_fds → CPython 断言崩溃。
-os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+# compile_threads=1：**仅 Windows**——多线程编译会走 SubprocPool 的 pass_fds → CPython
+# 断言崩溃。Linux（含 Kaggle）放开多线程，编译更快。
+if sys.platform == "win32":
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
 import torch
 from torch.utils.data import DataLoader
@@ -24,6 +26,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
+from model.train import ddp
 from model.train.data import SFTDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
@@ -62,9 +65,20 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
-    for step, batch in enumerate(loader):
-        if max_steps is not None and step >= max_steps:
+    # DDP 防死锁：各 rank 数据量可能不等，先耗尽者若退出循环会让其余 rank 卡在 all_reduce。
+    # 数据耗尽时重启迭代器继续，由 max_steps 统一步数（非分布式行为不变）。
+    it = iter(loader)
+    while True:
+        try:
+            batch = next(it)
+        except StopIteration:
+            if max_steps is None or steps >= max_steps:
+                break
+            it = iter(loader)
+            batch = next(it)
+        if max_steps is not None and steps >= max_steps:
             break
+        step = steps
         gstep = start_step + step          # **全局**步数：lr 调度与 checkpoint 都按它算
         t_step0 = time.time()
         # 只更新基准 lr，各组按 lr_mult 缩放（保留 Engram ×5，参考实现 §4.2.2）
@@ -72,22 +86,33 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         set_base_lr((muon, adamw, sinkhorn), lr)
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)
+        loss_mask = (labels != -100).float()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits, _ = model(ids)
-            loss = torch.nn.functional.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)),
-                labels[:, 1:].reshape(-1),
-                ignore_index=-100,
-            )
+            # 主干 + DSpark **一次 forward**：DSpark 前向必须在 model.forward 内，否则
+            # DDP 遍历不到 dspark 参数（前向在 forward 之外）→ 判其 unused → backward
+            # 收到梯度时报「Expected to mark a variable ready only once」。见 model.forward。
+            dspark_on = args.dspark and ddp.unwrap(model).dspark is not None
+            if dspark_on:
+                logits, _, out = model(ids, dspark_train={"loss_mask": loss_mask})
+            else:
+                logits, _ = model(ids)
+            # **全局 token 归一化**（DDP 逐位等价的关键）：单卡时 = 批内 mean（数值不变）；
+            # 多卡时各卡算 sum、按全局 valid token 数归一 → DDP 平均梯度后等于单卡全局 mean。
+            tgt = labels[:, 1:].reshape(-1)
+            ce_sum = torch.nn.functional.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.size(-1)), tgt,
+                ignore_index=-100, reduction="sum")
+            n_valid = (tgt != -100).sum()
+            loss = ddp.scale_loss_for_ddp(ce_sum, n_valid)
             # post-training 阶段同训 DSpark（照报告 §2.4.3）：主干由上面的 CE 更新；
             # DSpark 由 DSpark loss 更新。DSpark loss 的 target（主干 hidden/logits）
-            # 天然不带梯度（主干前向在 no_grad 外但 target 走 detach），故其梯度
-            # 不回传主干——正是参考实现「同训但梯度不回传 backbone」的语义。
-            if args.dspark and model.dspark is not None:
-                tc = model.cfg.text
-                loss_mask = (labels != -100).float()
-                out = model.dspark.forward_train(ids, model._last_main_hidden.detach(),
-                                                 loss_mask, aligned_target_logits=logits.detach())
+            # 天然不带梯度（target 走 detach），故其梯度不回传主干——正是参考实现
+            # 「同训但梯度不回传 backbone」的语义。
+            # **DDP 注意**：compute_dspark_loss 内部是 per-rank masked mean，多卡下
+            # 与全局 mean 不完全等价（各卡 mask 和 token 数不同）。SFT+dspark 同训属
+            # 阶段 5，上 DDP 前须先把其归一化改为全局（或确认差异可接受）。
+            if dspark_on:
+                tc = ddp.unwrap(model).cfg.text
                 dspark_loss = compute_dspark_loss(
                     out,
                     loss_decay_gamma=tc.dspark_loss_decay_gamma,
@@ -103,23 +128,24 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             muon.step(); adamw.step(); sinkhorn.step()
             muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad()
-            model.update_router_bias(args.router_bias_rate)
+            ddp.unwrap(model).update_router_bias(args.router_bias_rate)
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
-        if gstep % args.log_interval == 0:
-            # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度
+        if gstep % args.log_interval == 0 and ddp.is_main():
+            # 打印**瞬时**每步耗时（非累计均值），才能看清稳态速度。仅 rank0 打印。
             now = time.time()
             print(f"epoch {epoch} step {gstep} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
                   f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
             t_step0 = now
-        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
-        if args.save_interval and (gstep + 1) % args.save_interval == 0:
+        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**。
+        if args.save_interval and (gstep + 1) % args.save_interval == 0 and ddp.is_main():
             os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"sft_e{epoch}_s{gstep+1}.pth")
             # 存**完整训练状态**（模型 + 三优化器动量 + 步数），续训才能无缝接上。
+            # unwrap 去 `module.` 前缀，与单卡兼容。
             torch.save({
-                "model": model.state_dict(),
+                "model": ddp.unwrap(model).state_dict(),
                 "muon": muon.state_dict(),
                 "adamw": adamw.state_dict(),
                 "sinkhorn": sinkhorn.state_dict(),
@@ -180,7 +206,10 @@ def main():
     parser.add_argument("--log_file", type=str, default=None,
                         help="训练日志落盘路径（Python 内直写，不经 shell 管道；None=只打印控制台）")
     args = parser.parse_args()
-    setup_log_file(args.log_file)
+    # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
+    args.device = ddp.setup(args.device)
+    if ddp.is_main():
+        setup_log_file(args.log_file)
 
     torch.manual_seed(args.seed)
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
@@ -242,17 +271,30 @@ def main():
         adamw.load_state_dict(resume_ck["adamw"])
         sinkhorn.load_state_dict(resume_ck["sinkhorn"])
         print("已恢复三优化器状态（Muon/AdamW/Sinkhorn 动量）", flush=True)
+    # DDP 包装：**必须在 make_optimizers 之后**（否则 named_parameters 带 `module.` 前缀
+    # → 按名路由的优化器分组失效）。find_unused_parameters=True：MoE 每步有未激活专家。
+    model = ddp.wrap(model)
+
     os.makedirs(args.save_dir, exist_ok=True)
     global_step = start_step
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
+        # DDP 下各 rank 数据量可能不等 → 固定步数（否则先耗尽者退出循环致 all_reduce 死锁）。
+        ep_steps = max_steps
+        if ddp.is_distributed() and ep_steps is None:
+            ep_steps = max(ds.num_rows // args.batch_size // ddp.world_size(), 1)
         loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
-                              start_step=global_step, max_steps=max_steps)
+                              start_step=global_step, max_steps=ep_steps)
         global_step += n   # 跨 epoch 累加：lr 余弦调度与 checkpoint 间隔都按全局步数
-        print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {global_step} 步）")
-    torch.save(model.state_dict(), os.path.join(args.save_dir, "sft.pth"))
-    print("SFT 完成，已保存 sft.pth")
+        if ddp.is_main():
+            print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {global_step} 步）")
+    if ddp.is_main():
+        torch.save(ddp.unwrap(model).state_dict(), os.path.join(args.save_dir, "sft.pth"))
+        print("SFT 完成，已保存 sft.pth")
+    ddp.barrier()
+    ddp.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    # 多进程启动：单卡时直接跑；多卡时 spawn（notebook / 无 torchrun 环境也能用）。
+    ddp.launch(main)

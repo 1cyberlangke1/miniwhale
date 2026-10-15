@@ -15,20 +15,19 @@ import time
 from pathlib import Path
 
 # **必须在 import torch 之前**设：`torch._inductor.config` 首次 import 时用
-# `os.getenv(..., 默认)` 读取，之后设就无效。compile_threads=1：Windows 上多线程
-# 编译会走 SubprocPool 的 pass_fds → CPython 断言崩溃。不调 autotune warmup/rep
-# （调小等于拿 kernel 质量换编译时间）。
-os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+# `os.getenv(..., 默认)` 读取，之后设就无效。compile_threads=1：**仅 Windows**——
+# 多线程编译会走 SubprocPool 的 pass_fds → CPython 断言崩溃。Linux（含 Kaggle）放开
+# 多线程，编译更快。不调 autotune warmup/rep（调小等于拿 kernel 质量换编译时间）。
+if sys.platform == "win32":
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
+from model.train import ddp
 from model.train.data import PretrainDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
@@ -75,10 +74,21 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
     model.train()
     total_loss, steps = 0.0, 0
     t0 = time.time()
-    for step, batch in enumerate(loader):
+    # DDP 防死锁：各 rank 数据量可能不等，先耗尽者若退出循环会让其余 rank 卡在 all_reduce。
+    # 数据耗尽时重启迭代器继续，由 max_steps 统一步数（非分布式行为不变）。
+    it = iter(loader)
+    while True:
+        try:
+            batch = next(it)
+        except StopIteration:
+            if max_steps is None or steps >= max_steps:
+                break
+            it = iter(loader)
+            batch = next(it)
         # 按步数模式：到量即停（max_steps=0 → 0 步，字面语义，不是哨兵）
-        if max_steps is not None and step >= max_steps:
+        if max_steps is not None and steps >= max_steps:
             break
+        step = steps
         gstep = start_step + step          # **全局**步数：lr 调度与 checkpoint 都按它算
         t_step0 = time.time()
         # 学习率调度：warmup + cosine（只更新基准 lr，各组按 lr_mult 缩放——
@@ -90,17 +100,19 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         labels = batch["labels"].to(args.device)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits, _ = model(ids)
-            loss = torch.nn.functional.cross_entropy(
-                logits[:, :-1].reshape(-1, logits.size(-1)),
-                labels[:, 1:].reshape(-1),
-                ignore_index=-100,
-            )
-            loss = loss / args.accumulation_steps
+            # **全局 token 归一化**（DDP 逐位等价的关键）：单卡时 = 批内 mean（数值不变）；
+            # 多卡时各卡算 sum、按全局 valid token 数归一 → DDP 平均梯度后等于单卡全局 mean。
+            tgt = labels[:, 1:].reshape(-1)
+            ce_sum = torch.nn.functional.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.size(-1)), tgt,
+                ignore_index=-100, reduction="sum")
+            n_valid = (tgt != -100).sum()
+            loss = ddp.scale_loss_for_ddp(ce_sum, n_valid) / args.accumulation_steps
         # indexer loss 的梯度按主 loss scale 缩放（参考实现 DSA 做法）
         IndexerLossAutoScaler.set_loss_scale(loss.detach())
         loss.backward()
         # 首步含 torch.compile 冷编译 + autotune（前向+反向），单独计时打印，避免黑盒等待
-        if step == 0:
+        if step == 0 and ddp.is_main():
             torch.cuda.synchronize()
             print(f"[首次前向+反向 含编译] {(time.time() - t_step0):.1f}s", flush=True)
         if (gstep + 1) % args.accumulation_steps == 0:
@@ -108,24 +120,24 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
             muon.step(); adamw.step(); sinkhorn.step()
             muon.zero_grad(); adamw.zero_grad(); sinkhorn.zero_grad()
             # noaux_tc 纠正 bias 按负载均衡规则更新（非梯度）
-            model.update_router_bias(args.router_bias_rate)
+            ddp.unwrap(model).update_router_bias(args.router_bias_rate)
         total_loss += loss.item() * args.accumulation_steps
         steps += 1
-        if gstep % args.log_interval == 0:
-            # 打印**瞬时**每步耗时（不是累计均值），才能看清稳态速度
+        if gstep % args.log_interval == 0 and ddp.is_main():
+            # 打印**瞬时**每步耗时（不是累计均值），才能看清稳态速度。仅 rank0 打印。
             now = time.time()
             print(f"epoch {epoch} step {gstep} loss {total_loss / steps:.4f} "
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
                   f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
             t_step0 = now
-        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
-        if args.save_interval and (gstep + 1) % args.save_interval == 0:
+        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**，unwarp 去前缀。
+        if args.save_interval and (gstep + 1) % args.save_interval == 0 and ddp.is_main():
             os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"pretrain_e{epoch}_s{gstep+1}.pth")
             # 存**完整训练状态**（模型 + 三优化器动量 + 步数），续训才能无缝接上；
             # 只存权重会让 Muon/AdamW/Sinkhorn 动量归零（失忆）。
             torch.save({
-                "model": model.state_dict(),
+                "model": ddp.unwrap(model).state_dict(),
                 "muon": muon.state_dict(),
                 "adamw": adamw.state_dict(),
                 "sinkhorn": sinkhorn.state_dict(),
@@ -184,7 +196,10 @@ def main():
     parser.add_argument("--log_file", type=str, default=None,
                         help="训练日志落盘路径（Python 内直写，不经 shell 管道；None=只打印控制台）")
     args = parser.parse_args()
-    setup_log_file(args.log_file)
+    # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
+    args.device = ddp.setup(args.device)
+    if ddp.is_main():
+        setup_log_file(args.log_file)
 
     torch.manual_seed(args.seed)
     # 参数保持 **fp32 主权重**（按技术报告 §3.4："the FP32 master weights maintained
@@ -241,14 +256,26 @@ def main():
             start_step = int(m.group(1)) if m else 0
             print(f"从 {args.resume} 续训，起始 step {start_step}（旧格式：仅权重，优化器从零）",
                   flush=True)
+    # DDP 包装：**必须在 make_optimizers 之后**（否则 named_parameters 带 `module.` 前缀
+    # → 按名路由的优化器分组失效）。find_unused_parameters=True：MoE 每步有未激活专家。
+    model = ddp.wrap(model)
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
+        # DDP 下各 rank 数据量可能不等 → 固定步数（否则先耗尽者退出循环致 all_reduce 死锁）。
+        ep_steps = max_steps
+        if ddp.is_distributed() and ep_steps is None:
+            ep_steps = max(ds.num_rows // args.batch_size // ddp.world_size(), 1)
         loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
-                              start_step=start_step, max_steps=max_steps)
+                              start_step=start_step, max_steps=ep_steps)
         start_step += n   # 跨 epoch 累加：lr 余弦调度与 checkpoint 间隔都按全局步数
-        print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {start_step} 步）")
-        torch.save(model.state_dict(), os.path.join(args.save_dir, f"pretrain_e{epoch}.pth"))
+        if ddp.is_main():
+            print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {start_step} 步）")
+            torch.save(ddp.unwrap(model).state_dict(),
+                       os.path.join(args.save_dir, f"pretrain_e{epoch}.pth"))
+    ddp.barrier()
+    ddp.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    # 多进程启动：单卡时直接跑；多卡时 spawn（notebook / 无 torchrun 环境也能用）。
+    ddp.launch(main)

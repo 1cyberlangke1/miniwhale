@@ -23,8 +23,10 @@ import time
 from pathlib import Path
 
 # **必须在 import torch 之前**设（torch._inductor.config 首次 import 时读 env）。
-# compile_threads=1：Windows 上多线程编译会走 SubprocPool 的 pass_fds → CPython 断言崩溃。
-os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+# compile_threads=1：**仅 Windows**——多线程编译会走 SubprocPool 的 pass_fds → CPython
+# 断言崩溃。Linux（含 Kaggle）放开多线程，编译更快。
+if sys.platform == "win32":
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
 
 import torch
 from torch.utils.data import DataLoader
@@ -32,6 +34,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
+from model.train import ddp
 from model.train.data import PretrainDataset
 from model.train.dspark_loss import compute_dspark_loss
 from model.model import Model
@@ -103,7 +106,10 @@ def main():
                     help='torch.compile 模式（固定 "default"）')
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
-    setup_log_file(args.log_file)
+    # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
+    args.device = ddp.setup(args.device)
+    if ddp.is_main():
+        setup_log_file(args.log_file)
 
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
     # 见 train_pretrain 同名注释：bf16 参数会让 RMSNorm 权重的更新被舍入抹掉。
@@ -142,6 +148,9 @@ def main():
         if resume_ck is not None:
             opt.load_state_dict(resume_ck["opt"])
         print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
+    # DDP 包装：**必须在 freeze_backbone + opt 建立之后**（否则 trainable 列表与按名路由
+    # 会带 `module.` 前缀而失效）。DSpark 冻结主干只训 draft 头，梯度同步只覆盖 draft 参数。
+    model = ddp.wrap(model)
     model.train()
 
     # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
@@ -175,11 +184,11 @@ def main():
         labels = batch["labels"].to(args.device)
         loss_mask = (labels != -100).float()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            # 主干前向：拿 target 层 hidden 与全序列 logits（后者供 L1 蒸馏 / accept_rate）
-            logits, _ = model(ids)
-            context_hidden = model._last_main_hidden
-            out = model.dspark.forward_train(ids, context_hidden, loss_mask,
-                                             aligned_target_logits=logits)
+            # 主干 + DSpark **一次 forward**：DSpark 前向必须在 model.forward 内，
+            # 否则 DDP 遍历不到 dspark 参数（前向在 forward 之外）→ 判其 unused →
+            # backward 收到梯度时报「Expected to mark a variable ready only once」。
+            # 详见 model.forward 的 dspark_train 说明。
+            logits, _, out = model(ids, dspark_train={"loss_mask": loss_mask})
             loss = compute_dspark_loss(
                 out,
                 loss_decay_gamma=tc.dspark_loss_decay_gamma,
@@ -192,17 +201,17 @@ def main():
         torch.nn.utils.clip_grad_norm_(trainable, 1.0)
         opt.step()
         # noaux_tc 纠正 bias 按负载均衡规则更新（非梯度；主干 MoE 冻结但仍需均衡）
-        model.update_router_bias(args.router_bias_rate)
-        if step % args.log_interval == 0:
+        ddp.unwrap(model).update_router_bias(args.router_bias_rate)
+        if step % args.log_interval == 0 and ddp.is_main():
             print(f"dspark step {step}/{total_steps} loss {loss.item():.4f} "
                   f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
-        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）
-        if args.save_interval and (step + 1) % args.save_interval == 0:
+        # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**，unwarp 去前缀。
+        if args.save_interval and (step + 1) % args.save_interval == 0 and ddp.is_main():
             os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"dspark_s{step+1}.pth")
             # 存**完整训练状态**（模型 + 优化器动量 + 步数），续训才能无缝接上。
             torch.save({
-                "model": model.state_dict(),
+                "model": ddp.unwrap(model).state_dict(),
                 "opt": opt.state_dict(),
                 "step": step + 1,
             }, path)
@@ -219,10 +228,14 @@ def main():
                     os.remove(old)
             print(f"checkpoint saved at step {step+1}", flush=True)
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(args.save_dir, "dspark.pth"))
-    print("DSpark 训练完成")
+    if ddp.is_main():
+        os.makedirs(args.save_dir, exist_ok=True)
+        torch.save(ddp.unwrap(model).state_dict(), os.path.join(args.save_dir, "dspark.pth"))
+        print("DSpark 训练完成")
+    ddp.barrier()
+    ddp.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    # 多进程启动：单卡时直接跑；多卡时 spawn（notebook / 无 torchrun 环境也能用）。
+    ddp.launch(main)

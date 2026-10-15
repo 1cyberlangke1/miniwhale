@@ -10,10 +10,33 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import torch
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import IterableDataset
+
+from model.train.ddp import get_rank, is_distributed, shard_worker_index
+
+
+def _rank_shard(samples):
+    """给 HF 流式数据集加 **DDP rank 维度**分片（非分布式时原样返回）。
+
+    输入：HF `IterableDataset`（`load_dataset(..., streaming=True)` 产物）。
+    输出：本 rank 应读的子集，或原对象（非分布式）。
+    预期行为：用 HF 参考实现的 `split_dataset_by_node` 按 rank 切分——它正确处理
+              **shard 数 < world_size** 的情形（自动退化为按步长取模，各 rank 仍不重叠）。
+              **不能用 `samples.shard(num_shards=ws, index=rank)`**：单个 jsonl 文件只有
+              1 个 shard 时，`shard(2, 1)` 内部会取到空的下标列表而抛 IndexError
+              （HF issue #5881）——这正是双卡 rank 1 一读数据就崩的根因。
+              **非分布式时返回原对象** → 单卡路径逐位不变。
+    """
+    if not is_distributed():
+        return samples
+    from datasets.distributed import split_dataset_by_node
+
+    ws = int(os.environ.get("WORLD_SIZE", "1"))
+    return split_dataset_by_node(samples, rank=get_rank(), world_size=ws)
 
 
 def render_chat(tokenizer, conversations, *, max_length=None, truncation=False):
@@ -85,9 +108,9 @@ class PretrainDataset(IterableDataset):
             self.samples.set_epoch(epoch)
 
     def _stream(self):
-        """按配置返回文档流（流式打乱 / 顺序）。"""
+        """按配置返回文档流（流式打乱 / 顺序）。DDP 下按 rank 切分（非分布式时原样）。"""
         if self.streaming:
-            return self.samples
+            return _rank_shard(self.samples)
         return (self.samples[i] for i in torch.randperm(len(self.samples)).tolist())
 
     def __iter__(self):
@@ -188,7 +211,7 @@ class SFTDataset(IterableDataset):
 
     def __iter__(self):
         if self.streaming:
-            for row in self.samples:
+            for row in _rank_shard(self.samples):
                 yield self._encode(row)
         else:
             order = torch.randperm(len(self.samples)).tolist()
@@ -283,7 +306,7 @@ class MultimodalDataset(IterableDataset):
         return tokens, token_types, images
 
     def __iter__(self):
-        for row in self.samples:
+        for row in _rank_shard(self.samples):   # DDP 按 rank 切分（非分布式原样）
             yield self._encode_row(row)
 
     def _encode_row(self, row):
@@ -376,7 +399,7 @@ class ImageTextPairDataset(IterableDataset):
             self.samples.set_epoch(epoch)
 
     def __iter__(self):
-        for row in self.samples:
+        for row in _rank_shard(self.samples):   # DDP 按 rank 切分（非分布式原样）
             sample = self._encode_row(row)
             if sample is not None:
                 yield sample
@@ -497,9 +520,10 @@ class PreprocessedPairDataset(IterableDataset):
         pairs = [(i, k) for i in range(self.total) for k in range(self.num_captions)]
         if self.shuffle:
             random.Random(self.seed + self.epoch).shuffle(pairs)
-        wi = get_worker_info()
-        if wi is not None:                      # 多 worker：按下标取模切分，互不重叠
-            pairs = pairs[wi.id::wi.num_workers]
+        # (rank, worker) 合并分片：分布式下各 rank 各占一段，互不重叠；单进程原样。
+        idx, n = shard_worker_index()
+        if n > 1:
+            pairs = pairs[idx::n]
         for i, k in pairs:
             # uint16 memmap → bf16 张量：.copy() 保证可写连续（from_numpy 视图不能 view）
             yield {"patches": torch.from_numpy(patches[i].copy()).view(torch.bfloat16),
@@ -567,9 +591,10 @@ class PreprocessedVLDataset(IterableDataset):
         order = list(range(self.total))
         if self.shuffle:
             random.Random(self.seed + self.epoch).shuffle(order)
-        wi = get_worker_info()
-        if wi is not None:                    # 多 worker：按下标取模切分，互不重叠
-            order = order[wi.id::wi.num_workers]
+        # (rank, worker) 合并分片：分布式下各 rank 各占一段，互不重叠；单进程原样。
+        idx, n = shard_worker_index()
+        if n > 1:
+            order = order[idx::n]
 
         for i in order:
             images = []

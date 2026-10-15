@@ -105,15 +105,21 @@ class Model(nn.Module):
             self.image_newline = nn.Parameter(torch.randn(tc.hidden_size) * 0.02)
 
     def forward(self, input_ids, start_pos=0, token_mask=None, images=None, token_types=None,
-                full_logits=True):
+                full_logits=True, dspark_train=None):
         """主干前向（按参考实现 Transformer.forward 的 VL 接口）。
 
         输入：input_ids [B,L]；start_pos；token_mask [B,L]（False=图像位置，Engram 跳过）；
               images list[list[ImageInput]]（每样本的图像 span，参考实现 prepare_vl_inputs 产物）；
               token_types [B,L]（TEXT=-1，非负为图像位置类型）；
-              full_logits=False 时只算末位置（按参考实现 ParallelHead，推理/对拍用；训练需全序列）。
-        输出：(logits [B,L,V] 或 full_logits=False 时 [B,V], hidden [B,L,dim])。
+              full_logits=False 时只算末位置（按参考实现 ParallelHead，推理/对拍用；训练需全序列）；
+              dspark_train：None=不算 DSpark（默认，推理/对拍路径不变）；给定 dict（含
+              "loss_mask"）则在**本前向内**额外算 DSpark 训练前向，输出随 forward 返回。
+        输出：dspark_train=None → (logits [B,L,V] 或 full_logits=False 时 [B,V], hidden [B,L,dim])；
+              dspark_train 给定 → 三元组 (logits, hidden, dspark_out)。
         预期行为：图像 span 的占位位置被替换为 ViT/Aligner 特征与分隔符嵌入，再走主干。
+                  DSpark 同训（阶段 4/5）**必须在本 forward 内调用**——否则 DDP 遍历不到
+                  dspark 参数（其前向在 forward 之外），会判其 unused，backward 收到梯度时
+                  报「Expected to mark a variable ready only once」。
         """
         tc = self.cfg.text
         b, L = input_ids.shape
@@ -157,6 +163,13 @@ class Model(nn.Module):
         logits = self.head(hidden, full_logits=full_logits)
         self._last_main_hidden = (
             torch.cat(main_hiddens, dim=-1) if main_hiddens else None)
+        # DSpark 训练前向：**在本 forward 内调用**，输出随返回值一起交给 DDP（见 docstring）。
+        # detach 保证 dspark 梯度不回传主干（参考实现「同训但梯度不回传 backbone」）。
+        if dspark_train is not None and self.dspark is not None:
+            dspark_out = self.dspark.forward_train(
+                input_ids, self._last_main_hidden.detach(),
+                dspark_train["loss_mask"], aligned_target_logits=logits.detach())
+            return logits, hidden, dspark_out
         return logits, hidden
 
     def forward_spec(self, input_ids: torch.Tensor, start_pos: int = 0, temperature: float = 0.0):

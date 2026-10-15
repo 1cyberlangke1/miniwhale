@@ -9,12 +9,19 @@ kernel 质量/数值的 inductor 配置（不拿 kernel 质量换编译时间）
 from __future__ import annotations
 
 import os
+import sys
 
 # **必须在 import torch 之前**设这些 env：`torch._inductor.config` 在首次 import 时用
 # `os.getenv(..., 默认)` 读取它们，之后再设就无效（setdefault 静默失效）。放在模块顶部
 # 保证任何 import 本模块的路径都生效。
-# compile_threads=1：Windows 上多线程编译会走 SubprocPool 的 pass_fds → CPython 断言崩溃。
-os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+# compile_threads=1：**仅 Windows 需要**——多线程编译会走 SubprocPool 的 pass_fds →
+# CPython 断言崩溃。Linux（含 Kaggle）多线程编译更快，放开（默认 = CPU 核数）。
+if sys.platform == "win32":
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+# 编译缓存目录：由环境变量 TORCHINDUCTOR_CACHE_DIR 指定（不在此硬编码）。
+# 云端环境（如 Kaggle）把它指向**会话内可写且跨进程可见**的目录，即可让多个训练
+# 进程复用同一份编译产物；要跨会话复用，需把该目录持久化（存成云端数据集再挂载）。
+# 本机不设时用 torch 默认缓存目录，行为不变。
 
 import torch
 from torch import nn
