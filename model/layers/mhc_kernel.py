@@ -211,18 +211,17 @@ if TRITON_OK:
                 mixes.new_empty((B, L, 4, 4)), mixes.new_empty((B, L, H)),
                 mixes.new_empty((n, _ns(iters - 1), 16)))
 
-    def _mhc_setup(ctx, inputs, output):
-        """保存反向上下文：iters/eps + 全部输入 + S（都是张量，save_for_backward 直接存）。"""
-        mixes, hc_scale, hc_base, residual, pre_mix, iters, eps = inputs
-        ctx.iters, ctx.eps = iters, eps
-        ctx.save_for_backward(mixes, hc_scale, hc_base, residual, pre_mix, output[4])
+    @torch.library.custom_op("miniwhale::mhc_bwd", mutates_args=())
+    def mhc_bwd(gout: Tensor, gpre: Tensor, gpost: Tensor, gcomb: Tensor, mixes: Tensor,
+                hc_scale: Tensor, hc_base: Tensor, residual: Tensor, pre_mix: Tensor, S: Tensor,
+                iters: int, eps: float) -> tuple[Tensor, Tensor, Tensor]:
+        """融合 mHC 反向 kernel（custom_op：黑盒，避免 compile 追踪进 triton kernel）。
 
-    def _mhc_backward(ctx, gpre, gpost, gcomb, gout, gS):
-        """反向：跑 triton kernel（出 dm），torch 补 scale/base 梯度。
-
-        返回：(dmixes, dscale, dbase, dres, dprein, None, None)。
+        输入：gout [B,L,H]；gpre/gpost [B,L,4]；gcomb [B,L,4,4]；mixes [B,L,24]；hc_scale [3]；
+              hc_base [24]；residual [B,L,4,H]；pre_mix [B,L,4]；S；iters；eps。
+        输出：(dm [B,L,24] 缩放前, dres [B,L,4,H], dprein [B,L,4])。
+        预期行为：跑 triton 反向 kernel；scale/base 梯度由调用方在 torch 里从 dm 补。
         """
-        mixes, hc_scale, hc_base, residual, pre_mix, S = ctx.saved_tensors
         B, L, _ = mixes.shape
         H = residual.shape[-1]
         n = B * L
@@ -234,16 +233,43 @@ if TRITON_OK:
                        gpost.reshape(n, 4).contiguous(), gcomb.reshape(n, 16).contiguous(),
                        mixes.reshape(n, 24).contiguous(), hc_scale, hc_base,
                        residual.reshape(n, 4 * H).contiguous(), pre_mix.reshape(n, 4).contiguous(),
-                       S, dm, dres, dprein, ctx.iters - 1, ctx.eps, _ns(ctx.iters - 1), H)
+                       S, dm, dres, dprein, iters - 1, eps, _ns(iters - 1), H)
+        return dm.reshape(B, L, 24), dres.reshape(B, L, 4, H), dprein.reshape(B, L, 4)
+
+    @mhc_bwd.register_fake
+    def _(gout: Tensor, gpre: Tensor, gpost: Tensor, gcomb: Tensor, mixes: Tensor,
+          hc_scale: Tensor, hc_base: Tensor, residual: Tensor, pre_mix: Tensor, S: Tensor,
+          iters: int, eps: float):
+        """fake tensor 传播（compile 追踪用）。"""
+        B, L, _ = mixes.shape
+        H = residual.shape[-1]
+        return (mixes.new_empty((B, L, 24)), mixes.new_empty((B, L, 4, H)),
+                mixes.new_empty((B, L, 4)))
+
+    def _mhc_setup(ctx, inputs, output):
+        """保存反向上下文：iters/eps + 全部输入 + S（都是张量，save_for_backward 直接存）。"""
+        mixes, hc_scale, hc_base, residual, pre_mix, iters, eps = inputs
+        ctx.iters, ctx.eps = iters, eps
+        ctx.save_for_backward(mixes, hc_scale, hc_base, residual, pre_mix, output[4])
+
+    def _mhc_backward(ctx, gpre, gpost, gcomb, gout, gS):
+        """反向：调 mhc_bwd custom_op（黑盒出 dm），torch 补 scale/base 梯度。
+
+        返回：(dmixes, dscale, dbase, dres, dprein, None, None)。
+        """
+        mixes, hc_scale, hc_base, residual, pre_mix, S = ctx.saved_tensors
+        dm, dres, dprein = mhc_bwd(gout, gpre, gpost, gcomb, mixes, hc_scale, hc_base,
+                                   residual, pre_mix, S, ctx.iters, ctx.eps)
         # scale/base 梯度在 torch 里从 dm 补（确定、无 atomic）：dscale=Σ dm·mixes、dbase=Σ dm
+        n = mixes.shape[0] * mixes.shape[1]
         mf = mixes.reshape(n, 24)
-        dscale = torch.stack([(dm[:, :4] * mf[:, :4]).sum(),
-                              (dm[:, 4:8] * mf[:, 4:8]).sum(),
-                              (dm[:, 8:24] * mf[:, 8:24]).sum()])
-        dbase = dm.sum(0)
+        dmf = dm.reshape(n, 24)
+        dscale = torch.stack([(dmf[:, :4] * mf[:, :4]).sum(),
+                              (dmf[:, 4:8] * mf[:, 4:8]).sum(),
+                              (dmf[:, 8:24] * mf[:, 8:24]).sum()])
+        dbase = dmf.sum(0)
         scale = torch.cat([hc_scale[0].expand(4), hc_scale[1].expand(4), hc_scale[2].expand(16)])
-        return (dm * scale).reshape(mixes.shape), dscale, dbase, dres.reshape(residual.shape), \
-            dprein.reshape(pre_mix.shape), None, None
+        return (dm * scale).reshape(mixes.shape), dscale, dbase, dres, dprein, None, None
 
     torch.library.register_autograd(
         "miniwhale::mhc_fused", _mhc_backward, setup_context=_mhc_setup

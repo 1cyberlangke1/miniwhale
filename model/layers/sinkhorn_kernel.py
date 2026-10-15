@@ -199,6 +199,25 @@ if TRITON_OK:
         """fake tensor 传播（compile 追踪用）。"""
         return torch.empty_like(x), x.new_empty((x.numel() // (n * n), _ns(iters), n * n))
 
+    @torch.library.custom_op("miniwhale::sinkhorn_bwd", mutates_args=())
+    def sinkhorn_bwd(gy: Tensor, S: Tensor, iters: int, eps: float, n: int) -> Tensor:
+        """融合 sinkhorn 反向 kernel（custom_op：黑盒，避免 compile 追踪进 triton kernel）。
+
+        输入：gy 同前向输出形状；S 前向中间量 [M,NS,N*N]；iters=repeat-1；eps；n=N。
+        输出：gx 同 gy 形状。
+        预期行为：跑 triton 逆链 kernel。
+        """
+        nn = n * n
+        m = gy.numel() // nn
+        gx = torch.empty(m, n, n, device=gy.device, dtype=torch.float32)
+        _sink_bwd_kernel[(m,)](gy.reshape(m, n, n).contiguous(), S, gx, iters, eps, _ns(iters), n)
+        return gx.reshape(gy.shape)
+
+    @sinkhorn_bwd.register_fake
+    def _(gy: Tensor, S: Tensor, iters: int, eps: float, n: int) -> Tensor:
+        """fake tensor 传播（compile 追踪用）。"""
+        return torch.empty_like(gy)
+
     def _sink_setup(ctx, inputs, output):
         """保存反向所需上下文：iters/eps/n/形状 + 中间量 S。"""
         x, iters, eps, n = inputs
@@ -206,14 +225,9 @@ if TRITON_OK:
         ctx.save_for_backward(output[1])
 
     def _sink_backward(ctx, gy, gS):
-        """反向：跑 triton 逆链 kernel；返回 (dx, None, None, None)。"""
+        """反向：调 sinkhorn_bwd custom_op；返回 (dx, None, None, None)。"""
         (S,) = ctx.saved_tensors
-        n = ctx.n
-        m = gy.numel() // (n * n)
-        gx = torch.empty(m, n, n, device=gy.device, dtype=torch.float32)
-        _sink_bwd_kernel[(m,)](
-            gy.reshape(m, n, n).contiguous(), S, gx, ctx.iters, ctx.eps, _ns(ctx.iters), n
-        )
+        gx = sinkhorn_bwd(gy, S, ctx.iters, ctx.eps, ctx.n)
         return gx.reshape(ctx.shape), None, None, None
 
     torch.library.register_autograd(
