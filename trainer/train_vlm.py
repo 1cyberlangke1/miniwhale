@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
 from model.train import ddp
-from model.train.data import MultimodalDataset, PreprocessedVLDataset
+from model.train.data import MultimodalDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
@@ -165,10 +165,6 @@ def main():
     ap = argparse.ArgumentParser(description="miniwhale 多模态训练")
     ap.add_argument("--data_path", default="dataset/sft_i2t_mini.parquet",
                     help="纯图文 QA parquet（由 scripts/extract_i2t_mini.py 抽取）")
-    ap.add_argument("--pre_dir", default=None,
-                    help="离线预处理目录（scripts/preprocess_vit_ar.py 产出）。"
-                         "给定则走 PreprocessedVLDataset（零现场解码，num_workers 有效）；"
-                         "None 则走 MultimodalDataset（现场解码）。")
     ap.add_argument("--ckpt", default=None, help="已训练的主干权重（可选）")
     ap.add_argument("--vit_ckpt", default=None,
                     help="第一阶段（SigLIP 对比）产出的视觉编码器权重（可选；按参考实现两阶段）")
@@ -257,13 +253,8 @@ def main():
     # named_parameters() 带 `module.` 前缀 → make_optimizers 的按名路由（Muon/AdamW/
     # Sinkhorn 分组）会失效。故先建优化器（此时 model 未包），再包 DDP（见下方）。
 
-    if args.pre_dir:
-        # 离线预处理路径：零现场 PIL 解码，num_workers>0 真生效（memmap 下标取模切分）
-        ds = PreprocessedVLDataset(args.pre_dir)
-        print(f"使用预处理数据 {args.pre_dir}（{len(ds)} 条）", flush=True)
-    else:
-        ds = MultimodalDataset(args.data_path, tokenizer, max_length=args.seq_len,
-                               image_token_id=cfg.text.image_token_id, vision_cfg=cfg.vision)
+    ds = MultimodalDataset(args.data_path, tokenizer, max_length=args.seq_len,
+                           image_token_id=cfg.text.image_token_id, vision_cfg=cfg.vision)
     # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
     # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
     if not args.steps and not args.epochs:

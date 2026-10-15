@@ -11,8 +11,16 @@ Single-Pass 的错位：某个子层用到的 pre_mix 由**上一层**产出（�
 
 from __future__ import annotations
 
+import warnings
+
 import torch
 from torch import nn
+
+from .sinkhorn_kernel import can_fuse as _sink_can_fuse, triton_sinkhorn as _sink_triton
+from .mhc_kernel import can_fuse as _mhc_can_fuse, mhc_fused_call as _mhc_fused_call
+
+# 回退警告只发一次（sinkhorn 每步每层调用多次，避免刷屏）。
+_fallback_warned = False
 
 
 def sinkhorn_normalize(x: torch.Tensor, repeat: int = 20, eps: float = 1e-6) -> torch.Tensor:
@@ -21,8 +29,21 @@ def sinkhorn_normalize(x: torch.Tensor, repeat: int = 20, eps: float = 1e-6) -> 
     输入：x [..., n, n]，任意浮点。
     输出：同形状，行列交替归一后的双随机矩阵。
     预期行为：先 softmax(-1)+eps，再 (列归一, 行归一) 交替 repeat 次，每步分母 +eps。
-              注：迭代**本质串行**（每步依赖上一步），无法向量化；算子数靠 torch.compile 融合。
+              迭代**本质串行**（每步依赖上一步），torch.compile 无法融合 → 走融合 kernel
+              （`sinkhorn_kernel`，40 个串行 kernel 融成 1 个，与 torch eager **逐位一致**）。
+              shape/triton 不满足时回退下方 torch 实现（行为不变），并**警告一次**（暴露降级）。
     """
+    global _fallback_warned
+    if _sink_can_fuse(x):
+        return _sink_triton(x, repeat=repeat, eps=eps)
+    if not _fallback_warned:
+        _fallback_warned = True
+        warnings.warn(
+            f"融合 sinkhorn 不可用，回退 torch 实现（慢路径）：shape={tuple(x.shape)} "
+            f"dtype={x.dtype} cuda={x.is_cuda}。融合 kernel 仅支持 fp32 CUDA 上的方阵 "
+            f"N∈{{1,2,4,8,16}}（N 为 2 的幂）；且仅 N==4 与 torch 逐位一致。",
+            stacklevel=2,
+        )
     x = x.softmax(-1) + eps
     x = x / (x.sum(-2, keepdim=True) + eps)
     for _ in range(repeat - 1):
@@ -110,6 +131,29 @@ class HyperConnection(nn.Module):
         rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = torch.nn.functional.linear(flat, hc_fn.float()) * rsqrt
         return split_mixes(mixes, hc_scale, hc_base, self.hc_mult, self.sinkhorn_iters, self.hc_eps)
+
+    def hc_mixes_pre(self, x: torch.Tensor, pre_mix: torch.Tensor, which: str):
+        """融合：hc_mixes + hc_pre（两者用**同一个 x**，故可融成一次调用）。
+
+        输入：x [B,L,hc_mult,dim]；pre_mix [B,L,hc_mult]（上一层传入）；which ∈ {"attn","ffn"}。
+        输出：(pre, post, comb, h)，h 即 hc_pre 的折叠结果 [B,L,dim]。
+        预期行为：linear 后的 split_mixes(pre/post/comb) + sinkhorn + hc_pre(collapse) 走融合
+                  kernel（`mhc_kernel`，与参考实现 ~1e-7）；不满足则回退原 torch 实现（行为不变）。
+        """
+        hc_fn = getattr(self, f"hc_{which}_fn")
+        hc_scale = getattr(self, f"hc_{which}_scale")
+        hc_base = getattr(self, f"hc_{which}_base")
+        flat = x.flatten(2).float()
+        rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = torch.nn.functional.linear(flat, hc_fn.float()) * rsqrt
+        if _mhc_can_fuse(x, self.hc_mult, x.shape[-1]):
+            pre, post, comb, h = _mhc_fused_call(
+                mixes, hc_scale.float(), hc_base.float(), x.float(), pre_mix.float(),
+                self.sinkhorn_iters, self.hc_eps)
+            return pre, post, comb, h.to(x.dtype)
+        pre, post, comb = split_mixes(mixes, hc_scale, hc_base, self.hc_mult,
+                                      self.sinkhorn_iters, self.hc_eps)
+        return pre, post, comb, self.hc_pre(x, pre_mix)
 
     def hc_pre(self, x: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
         """折叠 hc 副本成一份。x [B,L,hc,dim] × pre_mix [B,L,hc] → [B,L,dim]。

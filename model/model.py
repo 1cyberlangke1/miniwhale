@@ -48,15 +48,13 @@ class Block(nn.Module):
                   Engram 注入由 Model 在调本块**之前**完成（按参考实现）。
         """
         residual = x
-        attn_pre, attn_post, attn_comb = self.hc.hc_mixes(x, "attn")
-        h = self.hc.hc_pre(x, pre_mix)
+        attn_pre, attn_post, attn_comb, h = self.hc.hc_mixes_pre(x, pre_mix, "attn")
         h = self.attn_norm(h)
         h = self.attn(h, start_pos, *attn_args)
         x = self.hc.hc_post(h, residual, attn_post, attn_comb)
 
         residual = x
-        ffn_pre, ffn_post, ffn_comb = self.hc.hc_mixes(x, "ffn")
-        h = self.hc.hc_pre(x, attn_pre)
+        ffn_pre, ffn_post, ffn_comb, h = self.hc.hc_mixes_pre(x, attn_pre, "ffn")
         h = self.ffn_norm(h)
         h = self.ffn(h, image_mask)
         x = self.hc.hc_post(h, residual, ffn_post, ffn_comb)

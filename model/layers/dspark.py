@@ -357,16 +357,14 @@ class DSparkBlock(nn.Module):
         预期行为：结构按参考实现 DSparkBlock.forward（train 分支）——mHC + attn + MoE。
         """
         residual = x
-        attn_pre, attn_post, attn_comb = self.hc.hc_mixes(x, "attn")
-        h = self.hc.hc_pre(x, pre_mix)
+        attn_pre, attn_post, attn_comb, h = self.hc.hc_mixes_pre(x, pre_mix, "attn")
         h = self.attn_norm(h)
         h = self.attn.forward_train(h, context_hidden, position_ids,
                                     anchor_positions, block_keep_mask, seq_len)
         x = self.hc.hc_post(h, residual, attn_post, attn_comb)
 
         residual = x
-        ffn_pre, ffn_post, ffn_comb = self.hc.hc_mixes(x, "ffn")
-        h = self.hc.hc_pre(x, attn_pre)
+        ffn_pre, ffn_post, ffn_comb, h = self.hc.hc_mixes_pre(x, attn_pre, "ffn")
         h = self.ffn_norm(h)
         h = self.ffn(h)
         x = self.hc.hc_post(h, residual, ffn_post, ffn_comb)
@@ -374,15 +372,13 @@ class DSparkBlock(nn.Module):
 
     def forward(self, x, start_pos, pre_mix, main_x):
         residual = x
-        attn_pre, attn_post, attn_comb = self.hc.hc_mixes(x, "attn")
-        h = self.hc.hc_pre(x, pre_mix)
+        attn_pre, attn_post, attn_comb, h = self.hc.hc_mixes_pre(x, pre_mix, "attn")
         h = self.attn_norm(h)
         h = self.attn(h, start_pos, main_x)
         x = self.hc.hc_post(h, residual, attn_post, attn_comb)
 
         residual = x
-        ffn_pre, ffn_post, ffn_comb = self.hc.hc_mixes(x, "ffn")
-        h = self.hc.hc_pre(x, attn_pre)
+        ffn_pre, ffn_post, ffn_comb, h = self.hc.hc_mixes_pre(x, attn_pre, "ffn")
         h = self.ffn_norm(h)
         h = self.ffn(h)
         x = self.hc.hc_post(h, residual, ffn_post, ffn_comb)
