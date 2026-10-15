@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -26,7 +27,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
-from model.train.data import MultimodalDataset
+from model.train.data import MultimodalDataset, PreprocessedVLDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
@@ -116,11 +117,23 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         if args.save_interval and (gstep + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"vlm_e{epoch}_s{gstep+1}.pth")
-            torch.save(model.state_dict(), path)
+            # 存**完整训练状态**（模型 + 三优化器动量 + 步数），续训才能无缝接上；
+            # 只存权重会让优化器动量归零（失忆）。
+            torch.save({
+                "model": model.state_dict(),
+                "muon": muon.state_dict(),
+                "adamw": adamw.state_dict(),
+                "sinkhorn": sinkhorn.state_dict(),
+                "step": gstep + 1,
+            }, path)
             if args.keep_last_n:
+                # 只清理**本次训练自己产生的中间档** `vlm_e<epoch>_s<step>.pth`。
+                # 曾用 `f.startswith("vlm_")` → 会连桶快照 `vlm_384.pth` 一起匹配删除（事故）。
+                # 用正则精确匹配中间档命名，桶快照（vlm_<bucket>.pth）不匹配 → 永不误删。
+                pat = re.compile(r"^vlm_e\d+_s\d+\.pth$")
                 cks = sorted(
                     (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
-                     if f.startswith("vlm_") and f.endswith(".pth")),
+                     if pat.match(f)),
                     key=os.path.getmtime)
                 for old in cks[:-args.keep_last_n]:
                     os.remove(old)
@@ -132,9 +145,16 @@ def main():
     ap = argparse.ArgumentParser(description="miniwhale 多模态训练")
     ap.add_argument("--data_path", default="dataset/sft_i2t_mini.parquet",
                     help="纯图文 QA parquet（由 scripts/extract_i2t_mini.py 抽取）")
+    ap.add_argument("--pre_dir", default=None,
+                    help="离线预处理目录（scripts/preprocess_vit_ar.py 产出）。"
+                         "给定则走 PreprocessedVLDataset（零现场解码，num_workers 有效）；"
+                         "None 则走 MultimodalDataset（现场解码）。")
     ap.add_argument("--ckpt", default=None, help="已训练的主干权重（可选）")
     ap.add_argument("--vit_ckpt", default=None,
                     help="第一阶段（SigLIP 对比）产出的视觉编码器权重（可选；按参考实现两阶段）")
+    ap.add_argument("--resume", default=None,
+                    help="从本阶段中间档续训（vlm_e{E}_s{STEP}.pth；恢复完整权重 + 解析起始步）。"
+                         "与 --ckpt 不同：--ckpt 是外部起点、lr 从 warmup 重来。")
     ap.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
     ap.add_argument("--steps", type=int, default=0,
                     help="按步数训练（默认 0）；与 --epochs 同时指定时 epoch 优先")
@@ -174,17 +194,49 @@ def main():
     cfg = ModelConfig.from_json()
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     if args.ckpt:
-        model.load_state_dict(torch.load(args.ckpt, map_location=args.device), strict=False)
+        # strict=False：主干权重里没有视觉塔的键是正常的（视觉塔另有 --vit_ckpt）。
+        # 但**必须打印缺失/多余的键**——否则起点权重键名对不上时静默拿随机初始化训，
+        # 表面在跑、实则白训（曾因静默吞键埋隐患）。
+        _st = torch.load(args.ckpt, map_location=args.device)
+        _miss, _unexp = model.load_state_dict(_st, strict=False)
+        print(f"载入主干 {args.ckpt}：缺失 {len(_miss)} 键 / 多余 {len(_unexp)} 键", flush=True)
+        if _miss:
+            print(f"  缺失（用随机初始化）: {_miss[:8]}{' …' if len(_miss) > 8 else ''}",
+                  flush=True)
+        if _unexp:
+            print(f"  多余（被忽略）: {_unexp[:8]}{' …' if len(_unexp) > 8 else ''}", flush=True)
     # 第二阶段从第一阶段（SigLIP 对比）的视觉编码器起（按参考实现：先对比预训练再自回归微调）
     if args.vit_ckpt:
         vit_state = torch.load(args.vit_ckpt, map_location=args.device)
         model.vision.load_state_dict(vit_state)
         print(f"已载入第一阶段视觉编码器 {args.vit_ckpt}", flush=True)
+    # 续训：从本阶段中间档（vlm_e{E}_s{STEP}.pth）恢复**完整**训练状态
+    # （模型权重 + 三个优化器动量 + 步数）。只存权重不存优化器 → 续训时 Muon/AdamW/
+    # Sinkhorn 的动量全归零，等于优化器失忆，比不续训好不了多少。优化器在下面才创建，
+    # 故此处先暂存 checkpoint，待 make_optimizers 后回填。
+    start_step, resume_ck = 0, None
+    if args.resume:
+        ck = torch.load(args.resume, map_location=args.device)
+        if isinstance(ck, dict) and "model" in ck:
+            model.load_state_dict(ck["model"])
+            start_step = int(ck.get("step", 0))
+            resume_ck = ck
+        else:
+            # 旧格式（仅权重）：向后兼容，步数从文件名解析
+            model.load_state_dict(ck)
+            m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
+            start_step = int(m.group(1)) if m else 0
+        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
     assert model.vision is not None, "模型未启用视觉塔"
 
-    ds = MultimodalDataset(args.data_path, tokenizer, max_length=args.seq_len,
-                           image_token_id=cfg.text.image_token_id, vision_cfg=cfg.vision)
+    if args.pre_dir:
+        # 离线预处理路径：零现场 PIL 解码，num_workers>0 真生效（memmap 下标取模切分）
+        ds = PreprocessedVLDataset(args.pre_dir)
+        print(f"使用预处理数据 {args.pre_dir}（{len(ds)} 条）", flush=True)
+    else:
+        ds = MultimodalDataset(args.data_path, tokenizer, max_length=args.seq_len,
+                               image_token_id=cfg.text.image_token_id, vision_cfg=cfg.vision)
     # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
     # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
     if not args.steps and not args.epochs:
@@ -207,9 +259,15 @@ def main():
 
     # 主干 + ViT/Aligner 一起训（参考实现：视觉塔与 LLM 联合优化）
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
+    if resume_ck is not None:
+        # 回填三优化器动量（resume_ck 在 make_optimizers 之前载入，此处才能恢复）
+        muon.load_state_dict(resume_ck["muon"])
+        adamw.load_state_dict(resume_ck["adamw"])
+        sinkhorn.load_state_dict(resume_ck["sinkhorn"])
+        print("已恢复三优化器状态（Muon/AdamW/Sinkhorn 动量）", flush=True)
 
     os.makedirs(args.save_dir, exist_ok=True)
-    global_step = 0
+    global_step = start_step
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮重排 shard 顺序 + shuffle buffer
         loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,

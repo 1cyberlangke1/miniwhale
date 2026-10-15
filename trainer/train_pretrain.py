@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -121,12 +122,23 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         if args.save_interval and (gstep + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"pretrain_e{epoch}_s{gstep+1}.pth")
-            torch.save(model.state_dict(), path)
-            # 只保留最近 N 个（按 mtime），避免塞满磁盘
+            # 存**完整训练状态**（模型 + 三优化器动量 + 步数），续训才能无缝接上；
+            # 只存权重会让 Muon/AdamW/Sinkhorn 动量归零（失忆）。
+            torch.save({
+                "model": model.state_dict(),
+                "muon": muon.state_dict(),
+                "adamw": adamw.state_dict(),
+                "sinkhorn": sinkhorn.state_dict(),
+                "step": gstep + 1,
+            }, path)
+            # 只清理**本次训练自己产生的中间档** `pretrain_e<epoch>_s<step>.pth`。
+            # 曾用 `f.startswith("pretrain_")` → 会连最终产物 `pretrain_e0.pth` 一起匹配删除。
+            # 用正则精确匹配中间档命名，最终产物（无 `_s<step>`）不匹配 → 永不误删。
             if args.keep_last_n:
+                pat = re.compile(r"^pretrain_e\d+_s\d+\.pth$")
                 cks = sorted(
                     (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
-                     if f.startswith("pretrain_") and f.endswith(".pth")),
+                     if pat.match(f)),
                     key=os.path.getmtime)
                 for old in cks[:-args.keep_last_n]:
                     os.remove(old)
@@ -213,14 +225,22 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     start_step = 0
     if args.resume:
-        # 续训：只恢复模型权重（优化器动量/调度步数不复位，故从 start_step 继续按调度取 lr）
-        state = torch.load(args.resume, map_location=args.device)
-        model.load_state_dict(state)
-        # 从 checkpoint 文件名解析已训步数（pretrain_e{E}_s{STEP}.pth）；解析不到则从 0 起
-        import re
-        m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
-        start_step = int(m.group(1)) if m else 0
-        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
+        # 续训：恢复**完整训练状态**（模型 + 三优化器动量 + 步数），无缝接上。
+        # 旧格式（仅权重）向后兼容：步数从文件名解析，优化器动量无法恢复（只能从零起）。
+        ck = torch.load(args.resume, map_location=args.device)
+        if isinstance(ck, dict) and "model" in ck:
+            model.load_state_dict(ck["model"])
+            start_step = int(ck.get("step", 0))
+            muon.load_state_dict(ck["muon"])
+            adamw.load_state_dict(ck["adamw"])
+            sinkhorn.load_state_dict(ck["sinkhorn"])
+            print(f"从 {args.resume} 续训，起始 step {start_step}（含三优化器动量）", flush=True)
+        else:
+            model.load_state_dict(ck)
+            m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
+            start_step = int(m.group(1)) if m else 0
+            print(f"从 {args.resume} 续训，起始 step {start_step}（旧格式：仅权重，优化器从零）",
+                  flush=True)
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
         loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,

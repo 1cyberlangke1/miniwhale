@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -116,11 +117,22 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         if args.save_interval and (gstep + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"sft_e{epoch}_s{gstep+1}.pth")
-            torch.save(model.state_dict(), path)
+            # 存**完整训练状态**（模型 + 三优化器动量 + 步数），续训才能无缝接上。
+            torch.save({
+                "model": model.state_dict(),
+                "muon": muon.state_dict(),
+                "adamw": adamw.state_dict(),
+                "sinkhorn": sinkhorn.state_dict(),
+                "step": gstep + 1,
+            }, path)
+            # 只清理**本次训练自己产生的中间档** `sft_e<epoch>_s<step>.pth`。
+            # 曾用 `f.startswith("sft_")` → 会连桶快照 `sft_<bucket>.pth` 一起匹配删除。
+            # 用正则精确匹配中间档命名，桶快照不匹配 → 永不误删。
             if args.keep_last_n:
+                pat = re.compile(r"^sft_e\d+_s\d+\.pth$")
                 cks = sorted(
                     (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
-                     if f.startswith("sft_") and f.endswith(".pth")),
+                     if pat.match(f)),
                     key=os.path.getmtime)
                 for old in cks[:-args.keep_last_n]:
                     os.remove(old)
@@ -132,6 +144,8 @@ def main():
     parser = argparse.ArgumentParser(description="miniwhale 全参数 SFT")
     parser.add_argument("--data_path", type=str, default="dataset/sft_t2t_mini.jsonl")
     parser.add_argument("--ckpt", type=str, default=None, help="预训练权重（可选）")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="从本阶段中间档续训（sft_e{E}_s{STEP}.pth；恢复完整训练状态）")
     parser.add_argument("--save_dir", type=str, default="out")
     parser.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
     parser.add_argument("--steps", type=int, default=0,
@@ -176,7 +190,27 @@ def main():
     tokenizer = load_tokenizer()
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     if args.ckpt:
-        model.load_state_dict(torch.load(args.ckpt, map_location=args.device), strict=False)
+        # strict=False：允许起点权重与当前模型有键差（如视觉塔）。
+        # 但**必须打印缺失/多余的键**——否则键名对不上时静默拿随机初始化训。
+        _st = torch.load(args.ckpt, map_location=args.device)
+        _miss, _unexp = model.load_state_dict(_st, strict=False)
+        print(f"载入 {args.ckpt}：缺失 {len(_miss)} 键 / 多余 {len(_unexp)} 键", flush=True)
+        if _miss:
+            print(f"  缺失（用随机初始化）: {_miss[:8]}{' …' if len(_miss) > 8 else ''}",
+                  flush=True)
+    # 续训：恢复完整训练状态（模型 + 三优化器动量 + 步数）。优化器在下方才创建，先暂存待回填。
+    start_step, resume_ck = 0, None
+    if args.resume:
+        ck = torch.load(args.resume, map_location=args.device)
+        if isinstance(ck, dict) and "model" in ck:
+            model.load_state_dict(ck["model"])
+            start_step = int(ck.get("step", 0))
+            resume_ck = ck
+        else:
+            model.load_state_dict(ck)
+            m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
+            start_step = int(m.group(1)) if m else 0
+        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
@@ -203,8 +237,13 @@ def main():
                         num_workers=args.num_workers, pin_memory=True)
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
+    if resume_ck is not None:
+        muon.load_state_dict(resume_ck["muon"])
+        adamw.load_state_dict(resume_ck["adamw"])
+        sinkhorn.load_state_dict(resume_ck["sinkhorn"])
+        print("已恢复三优化器状态（Muon/AdamW/Sinkhorn 动量）", flush=True)
     os.makedirs(args.save_dir, exist_ok=True)
-    global_step = 0
+    global_step = start_step
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
         loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,

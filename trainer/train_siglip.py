@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -114,13 +115,21 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
             t_step0 = now
         if args.save_interval and (gstep + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)
-            torch.save(model.image.vit.state_dict(),
-                       os.path.join(args.save_dir, f"vit_siglip_s{gstep+1}.pth"))
-            # 只保留最近 N 个（按 mtime），避免塞满磁盘
+            torch.save({
+                "model": model.state_dict(),
+                "muon": muon.state_dict(),
+                "adamw": adamw.state_dict(),
+                "sinkhorn": sinkhorn.state_dict(),
+                "step": gstep + 1,
+            }, os.path.join(args.save_dir, f"vit_siglip_s{gstep+1}.pth"))
+            # 只清理**本次训练自己产生的中间档** `vit_siglip_s<step>.pth`。
+            # 曾用 `f.startswith("vit_siglip_")` → 会连最终产物 `vit_siglip.pth` 一起匹配删除。
+            # 用正则精确匹配中间档命名，最终产物（无 `_s<step>`）不匹配 → 永不误删。
             if args.keep_last_n:
+                pat = re.compile(r"^vit_siglip_s\d+\.pth$")
                 cks = sorted(
                     (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
-                     if f.startswith("vit_siglip_") and f.endswith(".pth")),
+                     if pat.match(f)),
                     key=os.path.getmtime)
                 for old in cks[:-args.keep_last_n]:
                     os.remove(old)
@@ -131,6 +140,8 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
 def main():
     ap = argparse.ArgumentParser(description="miniwhale ViT SigLIP 对比预训练")
     ap.add_argument("--data_path", default="dataset/sft_i2t_mini.parquet")
+    ap.add_argument("--resume", default=None,
+                    help="从本阶段中间档续训（vit_siglip_s{STEP}.pth；恢复完整训练状态）")
     ap.add_argument("--source", default="conversations",
                     choices=["conversations", "flickr30k"],
                     help="数据格式：conversations（列 conversations+image_bytes）"
@@ -182,6 +193,19 @@ def main():
                    text_heads=args.text_heads).to(args.device)
     # 优化器分组（Muon/AdamW/Sinkhorn）按名字路由，需读 model.cfg.text.num_attention_heads
     model.cfg = cfg
+    # 续训：恢复完整训练状态（模型 + 三优化器动量 + 步数）。优化器在下方才创建，先暂存待回填。
+    start_step, resume_ck = 0, None
+    if args.resume:
+        ck = torch.load(args.resume, map_location=args.device)
+        if isinstance(ck, dict) and "model" in ck:
+            model.load_state_dict(ck["model"])
+            start_step = int(ck.get("step", 0))
+            resume_ck = ck
+        else:
+            model.load_state_dict(ck)
+            m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
+            start_step = int(m.group(1)) if m else 0
+        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
 
     # 预处理目录（含 meta.json）：读离线张量，零现场解码；否则现场从 parquet 解码。
@@ -213,8 +237,13 @@ def main():
                         num_workers=args.num_workers, collate_fn=collate_fn)
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
+    if resume_ck is not None:
+        muon.load_state_dict(resume_ck["muon"])
+        adamw.load_state_dict(resume_ck["adamw"])
+        sinkhorn.load_state_dict(resume_ck["sinkhorn"])
+        print("已恢复三优化器状态（Muon/AdamW/Sinkhorn 动量）", flush=True)
     os.makedirs(args.save_dir, exist_ok=True)
-    global_step = 0
+    global_step = start_step
     for epoch in range(epochs_to_run):
         ds.set_epoch(epoch)  # 流式数据集：每轮重排 shard 顺序 + shuffle buffer
         loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,

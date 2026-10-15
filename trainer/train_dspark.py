@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -76,6 +77,8 @@ def main():
     ap = argparse.ArgumentParser(description="miniwhale DSpark 训练")
     ap.add_argument("--data_path", default="dataset/pretrain_t2t_mini.jsonl")
     ap.add_argument("--ckpt", default=None, help="已训练的 backbone 权重（可选）")
+    ap.add_argument("--resume", default=None,
+                    help="从本阶段中间档续训（dspark_s{STEP}.pth；恢复完整训练状态）")
     ap.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
     ap.add_argument("--steps", type=int, default=0,
                     help="按步数训练（默认 0=不跑）；与 --epochs 同时指定时 epoch 优先")
@@ -108,7 +111,14 @@ def main():
     cfg = ModelConfig.from_json()
     model = Model(cfg, tokenizer=tokenizer).to(args.device)
     if args.ckpt:
-        model.load_state_dict(torch.load(args.ckpt, map_location=args.device), strict=False)
+        # strict=False：允许起点权重与当前模型有键差（主干 vs draft 头）。
+        # 但**必须打印缺失/多余的键**——否则键名对不上时静默拿随机初始化训。
+        _st = torch.load(args.ckpt, map_location=args.device)
+        _miss, _unexp = model.load_state_dict(_st, strict=False)
+        print(f"载入 {args.ckpt}：缺失 {len(_miss)} 键 / 多余 {len(_unexp)} 键", flush=True)
+        if _miss:
+            print(f"  缺失（用随机初始化）: {_miss[:8]}{' …' if len(_miss) > 8 else ''}",
+                  flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
     trainable = freeze_backbone(model)
     print(f"DSpark 可训练参数 {sum(p.numel() for p in trainable)/1e6:.2f}M")
@@ -117,6 +127,21 @@ def main():
     # 数据集是 IterableDataset（流式），自带缓冲打乱，DataLoader 不能再传 shuffle=True
     loader = DataLoader(ds, batch_size=args.batch, num_workers=0)
     opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95))
+    # 续训：恢复完整训练状态（模型 + 优化器动量 + 步数）。只存权重会让 AdamW 一/二阶矩归零。
+    start_step, resume_ck = 0, None
+    if args.resume:
+        ck = torch.load(args.resume, map_location=args.device)
+        if isinstance(ck, dict) and "model" in ck:
+            model.load_state_dict(ck["model"])
+            start_step = int(ck.get("step", 0))
+            resume_ck = ck
+        else:
+            model.load_state_dict(ck)
+            m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
+            start_step = int(m.group(1)) if m else 0
+        if resume_ck is not None:
+            opt.load_state_dict(resume_ck["opt"])
+        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
     model.train()
 
     # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
@@ -136,7 +161,7 @@ def main():
     epoch = 0
     ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
     it = iter(loader)
-    for step in range(total_steps):
+    for step in range(start_step, total_steps):
         lr = get_lr(step, total_steps, args.warmup_steps, args.lr, args.min_lr)
         for g in opt.param_groups:
             g["lr"] = lr
@@ -175,11 +200,20 @@ def main():
         if args.save_interval and (step + 1) % args.save_interval == 0:
             os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"dspark_s{step+1}.pth")
-            torch.save(model.state_dict(), path)
+            # 存**完整训练状态**（模型 + 优化器动量 + 步数），续训才能无缝接上。
+            torch.save({
+                "model": model.state_dict(),
+                "opt": opt.state_dict(),
+                "step": step + 1,
+            }, path)
+            # 只清理**本次训练自己产生的中间档** `dspark_s<step>.pth`。
+            # 曾用 `f.startswith("dspark_")` → 会连最终产物 `dspark.pth` 一起匹配删除。
+            # 用正则精确匹配中间档命名，最终产物（无 `_s<step>`）不匹配 → 永不误删。
             if args.keep_last_n:
+                pat = re.compile(r"^dspark_s\d+\.pth$")
                 cks = sorted(
                     (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
-                     if f.startswith("dspark_") and f.endswith(".pth")),
+                     if pat.match(f)),
                     key=os.path.getmtime)
                 for old in cks[:-args.keep_last_n]:
                     os.remove(old)

@@ -506,3 +506,84 @@ class PreprocessedPairDataset(IterableDataset):
                    "grid": self.grid,
                    "text_ids": torch.from_numpy(caps[i, k].copy()).long(),
                    "text_mask": torch.from_numpy(cmask[i, k].copy()).bool()}
+
+
+class PreprocessedVLDataset(IterableDataset):
+    """多模态预处理数据集（读**离线张量**，零现场解码）——ViT-AR 训练用。
+
+    输入：预处理目录（由 scripts/preprocess_vit_ar.py 产出）；shuffle（默认 True）；
+          seed。
+    输出（迭代）：{"input_ids":[L], "labels":[L], "token_types":[L],
+                  "images": list[ImageInput]}——与 MultimodalDataset 同构，
+                  故 collate_fn / 训练循环无需改动。
+    预期行为：从 memmap 按 index 读张量（零 PIL 解码、零 tokenize）；
+              **每样本最多 1 张图**（与 ViT-AR 数据规格一致）；
+              图像 span 的 ImageInput 用读出的 start / 网格 / patch 重建；
+              num_workers>0 时各 worker 按下标取模切分（memmap 路径，**不依赖 HF shard**，
+              故不受 `reshard()` 只切 1 个 shard 的限制）。
+    """
+
+    def __init__(self, pre_dir: str | Path, shuffle: bool = True, seed: int = 42):
+        import json
+
+        from model.image_processor import ImageInput
+
+        self.dir = str(pre_dir)
+        meta = json.loads(Path(self.dir, "meta.json").read_text(encoding="utf-8"))
+        self.total = meta["total"]
+        self.max_length = meta["max_length"]
+        self.max_patch = meta["max_patch"]
+        self.max_types = meta["max_types"]
+        self.shuffle = shuffle
+        self.seed = seed
+        self.epoch = 0
+        self._ImageInput = ImageInput
+        # **只存路径**，不在 __init__ 打开 memmap：spawn 起 worker 要 pickle 整个 dataset，
+        # np.memmap 不可 pickle。memmap 在 __iter__ 里由每个 worker 自己惰性打开。
+
+    def __len__(self):
+        return self.total
+
+    def set_epoch(self, epoch: int):
+        """每 epoch 前调用：换随机种子，样本顺序随之变化。"""
+        self.epoch = epoch
+
+    def __iter__(self):
+        import random
+
+        import numpy as np
+
+        d = self.dir
+        toks = np.load(Path(d, "tokens.npy"), mmap_mode="r")
+        labs = np.load(Path(d, "labels.npy"), mmap_mode="r")
+        ttys = np.load(Path(d, "ttypes.npy"), mmap_mode="r")
+        sts = np.load(Path(d, "img_start.npy"), mmap_mode="r")
+        ptc = np.load(Path(d, "patches.npy"), mmap_mode="r")
+        hw = np.load(Path(d, "n_vit_hw.npy"), mmap_mode="r")
+        npx = np.load(Path(d, "n_patch.npy"), mmap_mode="r")
+        ity = np.load(Path(d, "img_types.npy"), mmap_mode="r")
+        nty = np.load(Path(d, "n_types.npy"), mmap_mode="r")
+
+        order = list(range(self.total))
+        if self.shuffle:
+            random.Random(self.seed + self.epoch).shuffle(order)
+        wi = get_worker_info()
+        if wi is not None:                    # 多 worker：按下标取模切分，互不重叠
+            order = order[wi.id::wi.num_workers]
+
+        for i in order:
+            images = []
+            if sts[i] >= 0 and npx[i] > 0:
+                n_h, n_w = int(hw[i, 0]), int(hw[i, 1])
+                n_p = int(npx[i])
+                n_t = int(nty[i])
+                patches = torch.from_numpy(ptc[i, :n_p].copy()).view(torch.bfloat16)
+                # types **读存好的原样**（不按网格重算：现场 span 可能被序列长截断）
+                types = torch.from_numpy(ity[i, :n_t].copy()).long()
+                images.append(self._ImageInput(
+                    start=int(sts[i]), patches=patches, n_vit_h=n_h, n_vit_w=n_w,
+                    types=types))
+            yield {"input_ids": torch.from_numpy(toks[i].copy()).long(),
+                   "labels": torch.from_numpy(labs[i].copy()).long(),
+                   "token_types": torch.from_numpy(ttys[i].copy()).long(),
+                   "images": images}
