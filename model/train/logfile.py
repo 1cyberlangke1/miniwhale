@@ -31,15 +31,18 @@ class _Tee:
         self._fh.flush()
 
 
-def setup_log_file(path: str | None) -> None:
+def setup_log_file(path: str | None, append: bool = False) -> None:
     """把 stdout 重定向为「控制台 + 文件」双写。
 
-    输入：path 日志文件路径（None 或空 = 不启用，保持原样）。
+    输入：path 日志文件路径（None 或空 = 不启用，保持原样）；
+          append 是否**追加**（True=续训：接在同一文件，前端一条连续曲线；
+          False=新训练：覆盖，不与旧 run 混在同一文件）。
     输出：无（副作用：替换 sys.stdout 为 _Tee）。
-    预期行为：文件以**覆盖** + 行缓冲打开（每次训练调用 = 一条新曲线，不与旧 run 混在同一文件，
-              否则前端会把两次 run 的点连成一条误导曲线）；每行立即落盘；不捕获 stderr。
+    预期行为：append=False 以覆盖打开，append=True 以追加打开；均行缓冲，每行立即落盘；
+              不捕获 stderr。调用方在**续训**（--resume）时传 append=True。
     """
     if not path:
         return
-    fh = open(path, "w", encoding="utf-8", buffering=1)  # 覆盖 + 行缓冲：换行即 flush
+    # 覆盖 vs 追加 + 行缓冲：换行即 flush。
+    fh = open(path, "a" if append else "w", encoding="utf-8", buffering=1)
     sys.stdout = _Tee(fh)

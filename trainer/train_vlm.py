@@ -206,7 +206,7 @@ def main():
     # 导致 `flush=True` 的 print 也到不了文件（攒满 4KB 才吐）。
     # 分布式下只有 rank0 写日志，避免多进程争抢同一文件。
     if ddp.is_main():
-        setup_log_file(args.log_file)
+        setup_log_file(args.log_file, append=bool(args.resume))
 
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
     # 见 train_pretrain 同名注释：bf16 参数会让 RMSNorm 权重的更新被舍入抹掉。

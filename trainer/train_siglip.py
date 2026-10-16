@@ -204,7 +204,7 @@ def main():
     # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
     args.device = ddp.setup(args.device)
     if ddp.is_main():
-        setup_log_file(args.log_file)
+        setup_log_file(args.log_file, append=bool(args.resume))
 
     # 参数保持 fp32 主权重；计算走 bf16 autocast（同其它训练入口）。
     tokenizer = load_tokenizer()
