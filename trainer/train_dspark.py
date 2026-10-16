@@ -160,7 +160,7 @@ def main():
     if args.steps and args.epochs:
         print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
               f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
-        total_steps = max(len(ds) // args.batch, 1) * args.epochs
+        total_steps = max(len(ds) // args.batch // ddp.world_size(), 1) * args.epochs
     elif args.steps:
         total_steps = args.steps
     else:
@@ -171,6 +171,7 @@ def main():
     ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
     it = iter(loader)
     for step in range(start_step, total_steps):
+        t_step0 = time.time()   # 每步起点：打印**瞬时**耗时（非累计均值），看清稳态速度
         lr = get_lr(step, total_steps, args.warmup_steps, args.lr, args.min_lr)
         for g in opt.param_groups:
             g["lr"] = lr
@@ -189,7 +190,7 @@ def main():
             # backward 收到梯度时报「Expected to mark a variable ready only once」。
             # 详见 model.forward 的 dspark_train 说明。
             logits, _, out = model(ids, dspark_train={"loss_mask": loss_mask})
-            loss = compute_dspark_loss(
+            loss, loss_parts = compute_dspark_loss(
                 out,
                 loss_decay_gamma=tc.dspark_loss_decay_gamma,
                 ce_loss_alpha=tc.dspark_ce_loss_alpha,
@@ -203,8 +204,12 @@ def main():
         # noaux_tc 纠正 bias 按负载均衡规则更新（非梯度；主干 MoE 冻结但仍需均衡）
         ddp.unwrap(model).update_router_bias(args.router_bias_rate)
         if step % args.log_interval == 0 and ddp.is_main():
+            # 分项（未加权）便于看清哪一项在动/卡住：CE 学预测、L1 贴主干分布、conf 校准接受率。
             print(f"dspark step {step}/{total_steps} loss {loss.item():.4f} "
-                  f"lr {opt.param_groups[0]['lr']:.2e}", flush=True)
+                  f"ce {loss_parts['ce'].item():.4f} l1 {loss_parts['l1'].item():.4f} "
+                  f"conf {loss_parts['conf'].item():.4f} "
+                  f"lr {opt.param_groups[0]['lr']:.2e} "
+                  f"{(time.time() - t_step0) * 1000:.0f}ms/step", flush=True)
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**，unwarp 去前缀。
         if args.save_interval and (step + 1) % args.save_interval == 0 and ddp.is_main():
             os.makedirs(args.save_dir, exist_ok=True)

@@ -228,8 +228,10 @@ def main():
         epochs_to_run, max_steps = args.epochs, None  # 按轮次
     # 余弦调度总步数：按步数模式取 max_steps；按轮次模式按数据集行数 // batch × 轮数
     if not args.total_steps:
+        # 与 ep_steps 同分母（都除 world_size）；否则 DDP 下 lr 调度步数翻倍、只衰减一半。
         args.total_steps = (max_steps if max_steps
-                            else max(ds.num_rows // args.batch_size, 1) * epochs_to_run)
+                            else max(ds.num_rows // args.batch_size // ddp.world_size(), 1)
+                            * epochs_to_run)
     print(f"数据集 {ds.num_rows} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
     # 数据集是 IterableDataset（流式），自带缓冲打乱，DataLoader 不能再传 shuffle=True

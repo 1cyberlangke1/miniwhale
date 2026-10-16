@@ -113,7 +113,7 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
             # 阶段 5，上 DDP 前须先把其归一化改为全局（或确认差异可接受）。
             if dspark_on:
                 tc = ddp.unwrap(model).cfg.text
-                dspark_loss = compute_dspark_loss(
+                dspark_loss, _ = compute_dspark_loss(
                     out,
                     loss_decay_gamma=tc.dspark_loss_decay_gamma,
                     ce_loss_alpha=tc.dspark_ce_loss_alpha,
@@ -258,8 +258,10 @@ def main():
         epochs_to_run, max_steps = args.epochs, None
     # 数据集是 IterableDataset（流式），自带缓冲打乱，DataLoader 不能再传 shuffle=True
     if not args.total_steps:
+        # 与 ep_steps 同分母（都除 world_size）；否则 DDP 下 lr 调度步数翻倍、只衰减一半。
         args.total_steps = (max_steps if max_steps
-                            else max(ds.num_rows // args.batch_size, 1) * epochs_to_run)
+                            else max(ds.num_rows // args.batch_size // ddp.world_size(), 1)
+                            * epochs_to_run)
     print(f"数据集 {ds.num_rows} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
     loader = DataLoader(ds, batch_size=args.batch_size,

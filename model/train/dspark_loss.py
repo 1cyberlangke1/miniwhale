@@ -78,8 +78,9 @@ def compute_dspark_loss(
     """参考实现 compute_dspark_loss 的单卡版（数值公式一致）。
 
     输入：outputs（见 DSparkForwardOutput）；三个 alpha；位置衰减 gamma。
-    输出：标量 loss（可反传）。
-    预期行为：CE 与 L1 与 confidence 各按 mask 加权后归一，再按 alpha 线性组合。
+    输出：(总 loss（可反传）, {"ce","l1","conf"} 三项**未加权**归一值 dict（detach）)。
+    预期行为：CE 与 L1 与 confidence 各按 mask 加权后归一，再按 alpha 线性组合；
+              分项单独返回供日志/曲线观测（参考实现 add_metric 同口径）。
     """
     draft_logits = outputs.draft_logits
     _, _, block_size, vocab_size = draft_logits.shape
@@ -123,9 +124,13 @@ def compute_dspark_loss(
     ce_loss = ce_num / (ce_den + 1e-6)
     l1_loss = l1_num / (l1_den + 1e-6) if l1_den.item() > 0 else draft_logits.new_zeros(())
     conf_loss = conf_num / (conf_den + 1e-6) if has_conf else draft_logits.new_zeros(())
-    return (ce_loss_alpha * ce_loss
-            + l1_loss_alpha * l1_loss
-            + confidence_head_alpha * conf_loss)
+    total = (ce_loss_alpha * ce_loss
+             + l1_loss_alpha * l1_loss
+             + confidence_head_alpha * conf_loss)
+    # 分项（**未加权**的归一化值，参考实现 add_metric 同口径）：训练日志/曲线据此看清
+    # CE / L1 / confidence 各自趋势。只返回合成标量时，loss 平台期无法归因是哪项卡住。
+    parts = {"ce": ce_loss.detach(), "l1": l1_loss.detach(), "conf": conf_loss.detach()}
+    return total, parts
 
 
 __all__ = ["DSparkForwardOutput", "compute_dspark_loss"]

@@ -151,12 +151,20 @@ class SFTDataset(IterableDataset):
         self.streaming = streaming
         self.shuffle = shuffle
         self.seed = seed
-        self.samples = load_dataset("json", data_files=self.path, split="train",
+        # 格式按扩展名判定：`.parquet` 走 parquet（分桶 SFT 用），其余按 jsonl。
+        # 两者行结构一致（列 `conversations`，值可为 JSON 串），_encode 无需区分。
+        fmt = "parquet" if str(data_path).lower().endswith(".parquet") else "json"
+        self.samples = load_dataset(fmt, data_files=self.path, split="train",
                                     streaming=streaming)
-        # 行数：datasets 对本地 jsonl 已统计，流式/非流式都在 info.splits 里给，直接用。
-        # 极小的临时文件 datasets 可能不给 splits（None）——回退 0，调用方按 0 处理。
+        # 行数：datasets 对本地 jsonl 已统计（info.splits）；**但流式 parquet 不给**
+        # （num_examples=0）→ 回退读 parquet footer 的 num_rows。总步数 / lr 调度依赖它，
+        # 不能为 0（否则 lr 余弦在 0 步处即终止）。极小的临时文件两者都可能给 0，调用方按 0 处理。
         splits = getattr(self.samples.info, "splits", None)
-        self.num_rows = splits["train"].num_examples if splits and "train" in splits else 0
+        n_docs = splits["train"].num_examples if splits and "train" in splits else 0
+        if not n_docs and fmt == "parquet":
+            import pyarrow.parquet as pq
+            n_docs = pq.ParquetFile(self.path).metadata.num_rows
+        self.num_rows = n_docs
         # assistant 段起止标记（照 minimind：`<|im_start|>assistant\n` ... `<|im_end|>\n`）
         self.bos_id = tokenizer(f"{tokenizer.bos_token}assistant\n",
                                 add_special_tokens=False).input_ids

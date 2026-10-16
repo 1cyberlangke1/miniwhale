@@ -268,8 +268,11 @@ def main():
     else:
         epochs_to_run, max_steps = args.epochs, None
     if not args.total_steps:
+        # 必须与下方 ep_steps 同分母（都除 world_size）——否则 DDP 下 lr 余弦调度步数翻倍，
+        # 只衰减到一半就结束（768/1024 桶实测末 lr 停在 min_lr 的 5.6×，训练欠火候）。
         args.total_steps = (max_steps if max_steps
-                            else max(len(ds) // args.batch_size, 1) * epochs_to_run)
+                            else max(len(ds) // args.batch_size // ddp.world_size(), 1)
+                            * epochs_to_run)
     print(f"数据集 {len(ds)} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
     loader = DataLoader(ds, batch_size=args.batch_size,
