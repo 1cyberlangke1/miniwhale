@@ -142,7 +142,9 @@ class SFTDataset(IterableDataset):
     """
 
     def __init__(self, data_path: str | Path, tokenizer, max_length: int = 768,
-                 streaming: bool = True, shuffle: int = 1000, seed: int = 42):
+                 streaming: bool = True, shuffle: int = 1000, seed: int = 42,
+                 vision_cfg=None, image_token_id: int | None = None,
+                 image_placeholder: str = "<image>"):
         from datasets import load_dataset
 
         self.tokenizer = tokenizer
@@ -151,6 +153,13 @@ class SFTDataset(IterableDataset):
         self.streaming = streaming
         self.shuffle = shuffle
         self.seed = seed
+        # **多模态扩展**：给 vision_cfg + image_token_id 时，数据行若带 image_bytes
+        # 就把图像 span 展开进序列并输出 token_types/images（与 MultimodalDataset 同机制）；
+        # 不给时行为与纯文本 SFT 完全一致（向后兼容）。
+        self.vision_cfg = vision_cfg
+        self.image_token_id = image_token_id
+        self.image_placeholder = image_placeholder
+        self.multimodal = vision_cfg is not None and image_token_id is not None
         # 格式按扩展名判定：`.parquet` 走 parquet（分桶 SFT 用），其余按 jsonl。
         # 两者行结构一致（列 `conversations`，值可为 JSON 串），_encode 无需区分。
         fmt = "parquet" if str(data_path).lower().endswith(".parquet") else "json"
@@ -207,15 +216,46 @@ class SFTDataset(IterableDataset):
         convs = row.get("conversations", []) or []
         if isinstance(convs, str):
             convs = json.loads(convs)
+        raw = row.get("image_bytes") if self.multimodal else None
+        # 有图：把 `<image>` 换成 image_token 占位（一个），随后展开成参考实现 span。
+        if raw:
+            convs = [{**c, "content": str(c.get("content", "")).replace(
+                self.image_placeholder, self.tokenizer.decode([self.image_token_id]))}
+                for c in convs]
         # 保留 tools / tool_calls / reasoning_content（render_chat 解析，不丢字段）
         ids = render_chat(self.tokenizer, convs,
                           max_length=self.max_length, truncation=True)
         labels = self.generate_labels(ids)
+        token_types, images = None, []
+        if raw:
+            from model.image_processor import ImageInput, TEXT, image_token_types, load_image_from_bytes
+            vc = self.vision_cfg
+            patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = load_image_from_bytes(
+                raw, vc.patch_size, vc.downsample_ratio, vc.max_image_tokens,
+                vc.min_pixels, vc.max_wh_ratio)
+            types = image_token_types(n_llm_h, n_llm_w)
+            # 找到占位符位置：render 后 image_token 在序列中的位置（通常只有 1 个）
+            pos = next((i for i, t in enumerate(ids) if t == self.image_token_id), None)
+            if pos is not None and pos + types.numel() <= self.max_length:
+                # 把单 token 占位替换成完整 image span（IMAGE_START + 网格 + IMAGE_END）
+                ids = ids[:pos] + [self.image_token_id] * types.numel() + ids[pos + 1:]
+                # labels 同步：图像 span 不参与 loss（-100）
+                labels = (labels[:pos] + [-100] * types.numel() + labels[pos + 1:])
+                token_types = ([TEXT] * pos + types.tolist()
+                               + [TEXT] * (len(ids) - pos - types.numel()))
+                images = [ImageInput(pos, patches, n_vit_h, n_vit_w, types)]
         pad = self.tokenizer.pad_token_id
         input_ids = list(ids) + [pad] * (self.max_length - len(ids))
         labels = labels + [-100] * (self.max_length - len(labels))
-        return {"input_ids": torch.tensor(input_ids[:self.max_length]),
-                "labels": torch.tensor(labels[:self.max_length])}
+        out = {"input_ids": torch.tensor(input_ids[:self.max_length]),
+               "labels": torch.tensor(labels[:self.max_length])}
+        if self.multimodal:
+            if token_types is None:
+                token_types = [(-1)] * len(ids)
+            token_types = token_types + [(-1)] * (self.max_length - len(token_types))
+            out["token_types"] = torch.tensor(token_types[:self.max_length])
+            out["images"] = images
+        return out
 
     def __iter__(self):
         if self.streaming:

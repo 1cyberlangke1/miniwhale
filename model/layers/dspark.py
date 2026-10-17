@@ -25,6 +25,10 @@ from model.nn.norm import RMSNorm
 from model.nn.quant import fake_quant_fp8
 from model.nn.rope import apply_rotary_emb
 
+# 训练注意力沿 query 维的分块大小。8GB 上整块物化 [B,Q,H,S+Q] 会 OOM；
+# 沿 query 切**逐位等价**（softmax 每行独立）。256 是 Q=2048 的整除数。
+_ATTN_CHUNK = 256
+
 
 @lru_cache(1)
 def get_dspark_topk_idxs(window_size: int, bsz: int, block_size: int, start_pos: int,
@@ -65,8 +69,11 @@ def sample_anchor_positions(seq_len: int, loss_mask: torch.Tensor, num_anchors: 
     masked_indices = torch.where(valid, indices, torch.full_like(indices, seq_len + 1))
     random_vals = torch.rand(bsz, num_candidates, device=device)
     random_vals = torch.where(valid, random_vals, torch.full_like(random_vals, 2.0))
-    _, sorted_idx = random_vals.sort(dim=1)
-    gathered = torch.gather(masked_indices, 1, sorted_idx)
+    # 只需前 num_anchors 个随机位置：topk(largest=False) 与「升序 sort 后取前 N」**逐位等价**
+    # （都是取随机值最小的 N 个），但复杂度 O(S + N log N) 而非 O(S log S)。
+    k = min(num_anchors, num_candidates)
+    _, top_idx = random_vals.topk(k, dim=1, largest=False, sorted=True)
+    gathered = torch.gather(masked_indices, 1, top_idx)
     if num_candidates < num_anchors:
         pad = torch.full((bsz, num_anchors - num_candidates), seq_len + 1,
                          dtype=gathered.dtype, device=device)
@@ -101,6 +108,7 @@ def _dspark_train_mask(anchor_positions, block_keep_mask, seq_len, block_size, d
     输出：[B, N*K, S+N*K] bool。
     预期行为：query 块 j 位置 k 可见 —— context 位置 < anchor[b,j]，或**本块内全部** draft 位置
               （整块可见，无块内因果；按参考实现 `q_block_id == kv_block_id`）；仅当该块 keep 时。
+              调用方沿 query 维分块使用，避免整块物化（逐位等价，见 `_ATTN_CHUNK`）。
     """
     bsz, num_blocks = anchor_positions.shape
     q_len = num_blocks * block_size
@@ -188,14 +196,26 @@ class DSparkAttention(Attention):
         k_draft = _rope_with_freqs(k_draft.unsqueeze(2), draft_freqs, rd).squeeze(2)
 
         k = torch.cat([k_ctx, k_draft], dim=1)                  # [B,S+Q,head_dim]
-        scores = torch.einsum("bqhd,bkd->bqhk", q.float(), k.float()) * self.softmax_scale
         mask = _dspark_train_mask(anchor_positions, block_keep_mask, seq_len,
                                   self.block_size, x.device)     # [B,Q,S+Q]
-        scores = scores.masked_fill(~mask.unsqueeze(2), -torch.inf)
-        sink = self.attn_sink.view(1, 1, self.n_heads, 1).expand(bsz, q_len, self.n_heads, 1)
-        scores = torch.cat([scores, sink], dim=-1)
-        probs = torch.nan_to_num(scores.softmax(dim=-1)[..., :-1], nan=0.0)
-        o = torch.einsum("bqhk,bkd->bqhd", probs, k.float()).to(q.dtype)
+        # **沿 query 维分块**（逐位一致）：一次性物化 [B,Q,H,S+Q] 的 float32 在 8GB
+        # 上会 OOM（B=12,Q=2048,H=8,KV=2561 ≈ 2.0GB，backward 还要存一份）。
+        # softmax 对每个 query **行独立** → 沿 query 切不改变任何行内的规约顺序，
+        # 与整块计算**逐位等价**（沿 KV 切才会破坏：max/sum 的顺序会变）。
+        # 固定块数，torch.compile 展开进同一张图（不是逐块重编）。
+        kf = k.float()
+        qf = q.float()
+        outs = []
+        for s in range(0, q_len, _ATTN_CHUNK):
+            e = min(s + _ATTN_CHUNK, q_len)
+            sc = torch.einsum("bqhd,bkd->bqhk", qf[:, s:e], kf) * self.softmax_scale
+            sc = sc.masked_fill(~mask[:, s:e].unsqueeze(2), -torch.inf)
+            sink = self.attn_sink.view(1, 1, self.n_heads, 1).expand(
+                bsz, e - s, self.n_heads, 1)
+            sc = torch.cat([sc, sink], dim=-1)
+            pr = torch.nan_to_num(sc.softmax(dim=-1)[..., :-1], nan=0.0)
+            outs.append(torch.einsum("bqhk,bkd->bqhd", pr, kf))
+        o = torch.cat(outs, dim=1).to(q.dtype)
 
         o = o.reshape(bsz, q_len, self.n_groups, -1).to(self.wo_a.weight.dtype)
         wo_a = self.wo_a.weight.view(self.n_groups, self.o_lora_rank, -1)
@@ -520,10 +540,12 @@ class DSparkHead(nn.Module):
         # aligned target logits：位置 s 的目标分布用主干在 s-1 的 logits
         aligned = None
         if aligned_target_logits is not None:
-            pred_idx = (safe_label - 1).clamp(min=0)
-            aligned = torch.gather(
-                aligned_target_logits.unsqueeze(1).expand(-1, num_blocks, -1, -1), 2,
-                pred_idx.unsqueeze(-1).expand(-1, -1, -1, aligned_target_logits.size(-1)))
+            pred_idx = (safe_label - 1).clamp(min=0)          # [B,N,K]
+            # 按 (b, s) 索引原张量 [B,S,V] 取 [B,N,K,V]。等价于对 expand 后的
+            # [B,N,S,V] 做 gather，但**不实体化** [B,N,S,V] 中间张量。
+            # 纯索引取值、无浮点运算 → 逐位一致。
+            b_idx = torch.arange(bsz, device=device).view(bsz, 1, 1).expand_as(pred_idx)
+            aligned = aligned_target_logits[b_idx, pred_idx]   # [B,N,K,V]
 
         return DSparkForwardOutput(
             draft_logits=base_logits, target_ids=target_ids, eval_mask=eval_mask,

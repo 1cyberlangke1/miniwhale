@@ -24,6 +24,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+# L1 蒸馏沿 anchor 维的分块大小。整块要物化两份 [B,N,K,V] float32 概率，
+# 8GB 上会 OOM；沿 N 切**逐位等价**（softmax 每个 token 独立）。
+_L1_CHUNK = 64
+
 
 @dataclass
 class DSparkForwardOutput:
@@ -61,10 +65,16 @@ def _accept_rate_3d(outputs: DSparkForwardOutput, aligned_target_logits):
     """
     if aligned_target_logits is None:
         return None
-    draft_probs = torch.softmax(outputs.draft_logits.float(), dim=-1)
-    target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)
-    accept = 1.0 - 0.5 * (draft_probs - target_probs).abs().sum(dim=-1)
-    return accept.clamp_(0.0, 1.0)
+    # 只作为 BCE 的 **target**（调用处 detach）→ 不需要梯度；沿 anchor 维分块，
+    # 避免同时物化两份 [B,N,K,V] float32（8GB 上会 OOM）。逐位等价（softmax 每 token 独立）。
+    outs = []
+    with torch.no_grad():
+        for s in range(0, outputs.draft_logits.size(1), _L1_CHUNK):
+            e = min(s + _L1_CHUNK, outputs.draft_logits.size(1))
+            dp = torch.softmax(outputs.draft_logits[:, s:e].float(), dim=-1)
+            tp = torch.softmax(aligned_target_logits[:, s:e].float(), dim=-1)
+            outs.append(1.0 - 0.5 * (dp - tp).abs().sum(dim=-1))
+    return torch.cat(outs, dim=1).clamp_(0.0, 1.0)
 
 
 def compute_dspark_loss(
@@ -103,10 +113,16 @@ def compute_dspark_loss(
     l1_num = draft_logits.new_zeros(())
     l1_den = draft_logits.new_zeros(())
     if l1_loss_alpha > 0 and aligned is not None:
-        draft_probs = torch.softmax(draft_logits.float(), dim=-1)
-        target_probs = torch.softmax(aligned.float(), dim=-1)
-        l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
-        l1_num = (l1_per_token * wmask).sum()
+        # **沿 anchor 维分块**：draft_probs/target_probs 是 [B,N,K,V] 的 float32
+        # （8×512×4×6400×4B ≈ 419MB 各一份，反向再存中间量），8GB 上会 OOM。
+        # softmax 对每个 token 独立 → 沿 N 切与整块**逐位等价**（已实测 torch.equal）。
+        l1_num = draft_logits.new_zeros(())
+        for s in range(0, draft_logits.size(1), _L1_CHUNK):
+            e = min(s + _L1_CHUNK, draft_logits.size(1))
+            dp = torch.softmax(draft_logits[:, s:e].float(), dim=-1)
+            tp = torch.softmax(aligned[:, s:e].float(), dim=-1)
+            l1_per_token = (dp - tp).abs().sum(dim=-1)
+            l1_num = l1_num + (l1_per_token * wmask[:, s:e]).sum()
         l1_den = wmask.sum()
 
     # confidence：BCE(confidence_pred, accept_rate)

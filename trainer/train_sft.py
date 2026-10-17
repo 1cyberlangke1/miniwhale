@@ -53,6 +53,21 @@ def get_lr(step, total_steps, warmup_steps, base_lr, min_lr):
     return min_lr + (base_lr - min_lr) * cos
 
 
+def collate_fn(batch):
+    """把多模态样本拼成 batch；图像 span 保持 list（每样本的图像输入）。
+
+    输入：样本 dict 列表（MultimodalDataset 产物）。
+    输出：{"input_ids":[B,L], "labels":[B,L], "token_types":[B,L], "images": list[list]}。
+    预期行为：张量字段 stack，images 原样保留为嵌套 list（含 ImageInput 对象）。
+    """
+    return {
+        "input_ids": torch.stack([b["input_ids"] for b in batch]),
+        "labels": torch.stack([b["labels"] for b in batch]),
+        "token_types": torch.stack([b["token_types"] for b in batch]),
+        "images": [b["images"] for b in batch],
+    }
+
+
 def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
                 max_steps=None):
     """跑一个 epoch（或按步数模式跑到 max_steps）。
@@ -86,16 +101,23 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         set_base_lr((muon, adamw, sinkhorn), lr)
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)
-        loss_mask = (labels != -100).float()
+        # 多模态：图像 span 与 token_types（TEXT=-1，非负为图像位置类型）
+        token_types = batch["token_types"].to(args.device)
+        images = batch["images"] if any(batch["images"]) else None
+        dspark_on = args.dspark and ddp.unwrap(model).dspark is not None
+        # 只在 DSpark 开启时才建 loss_mask（未开时这张量纯属浪费）。
+        loss_mask = (labels != -100).float() if dspark_on else None
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             # 主干 + DSpark **一次 forward**：DSpark 前向必须在 model.forward 内，否则
             # DDP 遍历不到 dspark 参数（前向在 forward 之外）→ 判其 unused → backward
             # 收到梯度时报「Expected to mark a variable ready only once」。见 model.forward。
-            dspark_on = args.dspark and ddp.unwrap(model).dspark is not None
+            # 多模态：有图时传 images/token_types（与阶段 3 的 VL 前向同一接口）。
+            # 无图样本 token_types 全 -1，前向行为与纯文本完全一致。
             if dspark_on:
-                logits, _, out = model(ids, dspark_train={"loss_mask": loss_mask})
+                logits, _, out = model(ids, images=images, token_types=token_types,
+                                       dspark_train={"loss_mask": loss_mask})
             else:
-                logits, _ = model(ids)
+                logits, _ = model(ids, images=images, token_types=token_types)
             # **全局 token 归一化**（DDP 逐位等价的关键）：单卡时 = 批内 mean（数值不变）；
             # 多卡时各卡算 sum、按全局 valid token 数归一 → DDP 平均梯度后等于单卡全局 mean。
             tgt = labels[:, 1:].reshape(-1)
@@ -169,7 +191,10 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
 def main():
     parser = argparse.ArgumentParser(description="miniwhale 全参数 SFT")
     parser.add_argument("--data_path", type=str, default="dataset/sft_t2t_mini.jsonl")
-    parser.add_argument("--ckpt", type=str, default=None, help="预训练权重（可选）")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="起点权重：**只能**是上一阶段（阶段 4）的产物 dspark.pth。"
+                             "它是完整模型（主干 + vision.* + aligner.* + dspark.*，416 键），"
+                             "SFT 直接在此基础上继续训。更早阶段的权重会跳过已训好的组件，不可使用")
     parser.add_argument("--resume", type=str, default=None,
                         help="从本阶段中间档续训（sft_e{E}_s{STEP}.pth；恢复完整训练状态）")
     parser.add_argument("--save_dir", type=str, default="out")
@@ -194,9 +219,10 @@ def main():
                         help="每多少步存一次 checkpoint（0=不存）")
     parser.add_argument("--keep_last_n", type=int, default=3,
                         help="只保留最近 N 个 checkpoint（0=全留）")
-    parser.add_argument("--dspark", action="store_true",
+    parser.add_argument("--dspark", action=argparse.BooleanOptionalAction, default=True,
                         help="post-training 阶段同训 DSpark（照报告 §2.4.3；主干由 CE 训，"
-                             "DSpark 由 DSpark loss 训，梯度不回传主干）")
+                             "DSpark 由 DSpark loss 训，梯度不回传主干）。**默认开启**，"
+                             "与报告一致；确需关闭用 --no-dspark")
     parser.add_argument("--compile", action="store_true",
                         help="用 torch.compile 加速训练（保持 inductor 默认数值语义）")
     parser.add_argument("--compile_mode", type=str, default="default",
@@ -221,7 +247,12 @@ def main():
     if args.ckpt:
         # strict=False：允许起点权重与当前模型有键差（如视觉塔）。
         # 但**必须打印缺失/多余的键**——否则键名对不上时静默拿随机初始化训。
+        # 训练中间档是 {"model","muon","adamw","sinkhorn","step"}（见 --resume 分支）；
+        # 传这种档给 --ckpt（如上一桶产物）时必须解包 "model"，否则 416 键全对不上、
+        # 静默从随机初始化训。纯 state_dict 则原样使用。
         _st = torch.load(args.ckpt, map_location=args.device)
+        if isinstance(_st, dict) and "model" in _st:
+            _st = _st["model"]
         _miss, _unexp = model.load_state_dict(_st, strict=False)
         print(f"载入 {args.ckpt}：缺失 {len(_miss)} 键 / 多余 {len(_unexp)} 键", flush=True)
         if _miss:
@@ -243,7 +274,11 @@ def main():
     model = maybe_compile(model, args.compile, args.compile_mode)
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
-    ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # **多模态 SFT**（报告 §1：post-training 覆盖 text + multimodal）：SFTDataset 已扩展
+    # 支持 image_bytes——给 vision_cfg/image_token_id 时展开图像 span 并输出
+    # token_types/images；数据无图时行为与纯文本 SFT 完全一致。
+    ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len,
+                    vision_cfg=cfg.vision, image_token_id=cfg.text.image_token_id)
     # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
     # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
     if not args.steps and not args.epochs:
@@ -264,7 +299,9 @@ def main():
                             * epochs_to_run)
     print(f"数据集 {ds.num_rows} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
           flush=True)
-    loader = DataLoader(ds, batch_size=args.batch_size,
+    # collate_fn 必须显式给：多模态样本的 `images` 是长度不定的嵌套 list，
+    # 默认 collate 会按「等长」去 stack 而报错。
+    loader = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate_fn,
                         num_workers=args.num_workers, pin_memory=True)
 
     muon, adamw, sinkhorn = make_optimizers(model, lr=args.learning_rate)
