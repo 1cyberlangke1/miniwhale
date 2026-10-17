@@ -34,7 +34,6 @@ try:
 except Exception:
     TRITON_OK = False
 
-_MIX_HC = 24          # (2 + hc_mult) * hc_mult, hc_mult=4
 _MAX_H = 4096         # hidden_size 上限（一个 program 装 4*H 个 fp32）
 
 

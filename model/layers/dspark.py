@@ -16,10 +16,9 @@ from __future__ import annotations
 from functools import lru_cache
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
-from model.layers.attention import Attention, get_window_topk_idxs
+from model.layers.attention import Attention
 from model.nn.linear import Head, Linear
 from model.nn.norm import RMSNorm
 from model.nn.quant import fake_quant_fp8
@@ -177,7 +176,7 @@ class DSparkAttention(Attention):
               position_ids [B,Q]；anchor_positions [B,N]；block_keep_mask [B,N]；seq_len。
         输出：[B,Q,D]。
         预期行为：按参考实现 create_dspark_attention_mask —— query(b,j,k) 看 context 位置 < anchor[b,j]，
-                  以及本块 draft 位置 k'<=k；dummy 块整体屏蔽。
+                  以及本块内全部 draft 位置（无块内因果）；dummy 块整体屏蔽。
         """
         bsz, q_len, _ = x.shape
         rd = self.rope_head_dim
@@ -293,10 +292,10 @@ class DSparkMarkovHead(nn.Module):
         """把 markov 隐状态投成 logits 偏置（按参考实现 project_bias）。"""
         return self.head(latent_states)
 
-    def apply_block_logits(self, base_logits, *, token_ids, hidden_states=None):
+    def apply_block_logits(self, base_logits, *, token_ids):
         """对整块各位置加 markov 偏置（按参考实现 VanillaMarkov.apply_block_logits）。
 
-        输入：base_logits [B,N,K,V]；token_ids [B,N,K]（各位置真实前驱）；hidden_states 未用。
+        输入：base_logits [B,N,K,V]；token_ids [B,N,K]（各位置真实前驱）。
         输出：[B,N,K,V]。
         预期行为：偏置 = head(embed(prev_token))，与 base_logits 相加。
         """
@@ -338,10 +337,8 @@ class DSparkBlock(nn.Module):
         from model.layers.moe import MoE
 
         self.layer_id = layer_id
-        self.stage_id = stage_id
         self.hc_mult = text_cfg.hc_mult
         self.block_size = text_cfg.dspark_block_size
-        self.noise_token_id = text_cfg.dspark_noise_token_id
 
         self.attn = DSparkAttention(text_cfg, layer_id)
         # 参考实现 get_moe_config：DSpark 层用 dspark_n_routed_experts（0 则回退主干）
@@ -527,8 +524,7 @@ class DSparkHead(nn.Module):
         # teacher-forced markov 偏置：位置 k 用真实前驱 token（anchor 或 target[:,k-1]）
         anchor_ids = torch.gather(input_ids, 1, anchors)
         prev_ids = torch.cat([anchor_ids.unsqueeze(-1), target_ids[:, :, :-1]], dim=-1)
-        base_logits = last.markov_head.apply_block_logits(
-            base_logits, token_ids=prev_ids, hidden_states=h4)
+        base_logits = last.markov_head.apply_block_logits(base_logits, token_ids=prev_ids)
 
         eval_mask = build_eval_mask(seq_len, loss_mask, label_indices, safe_label, keep)
 

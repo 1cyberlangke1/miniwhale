@@ -7,9 +7,7 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -32,33 +30,11 @@ from model.train.data import PretrainDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
+from model.train.checkpoint import load_resume_ckpt, save_checkpoint
 from model.train.logfile import setup_log_file
+from model.train.scheduler import get_lr
 from model.train.optim import make_optimizers, set_base_lr
 from model.tokenizer import load_tokenizer
-
-
-def get_lr(step, total_steps, warmup_steps, base_lr, min_lr,
-           decay_start=0.62, decay_end=0.89):
-    """学习率调度（按参考实现报告 §4.2.2 的三段式）。
-
-    输入：step 当前步；total_steps 总步数；warmup_steps 预热步数；base_lr 峰值 lr；
-          min_lr 最低 lr；decay_start / decay_end 余弦衰减窗口（占全程比例）。
-    输出：本步的 lr。
-    预期行为：前 warmup_steps 步从 base_lr/10 线性升到 base_lr；之后**恒定**保持 base_lr
-              直到 decay_start·total_steps；再按余弦降到 min_lr（到 decay_end·total_steps）；
-              末尾恒定 min_lr。参考实现：2.6e-4 恒定到 62%，余弦降到 2.6e-5（89%），其后不变。
-    为什么不是「warmup 后立刻余弦」：那样后段 lr 早已衰减到近零，loss 会提前卡住不动。
-    """
-    if step < warmup_steps:
-        return base_lr * (0.1 + 0.9 * step / max(warmup_steps, 1))
-    start, end = decay_start * total_steps, decay_end * total_steps
-    if step <= start:
-        return base_lr
-    if step >= end:
-        return min_lr
-    ratio = (step - start) / max(end - start, 1)
-    cos = 0.5 * (1.0 + math.cos(math.pi * ratio))
-    return min_lr + (base_lr - min_lr) * cos
 
 
 def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
@@ -94,7 +70,8 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
         # 学习率调度：warmup + cosine（只更新基准 lr，各组按 lr_mult 缩放——
         # 这样 Engram 的 ×5 学习率不会被抹平，参考实现 §4.2.2）
         lr = get_lr(gstep, args.total_steps, args.warmup_steps,
-                    args.learning_rate, args.min_lr)
+                    args.learning_rate, args.min_lr,
+                    decay_start=0.62, decay_end=0.89)
         set_base_lr((muon, adamw, sinkhorn), lr)
         ids = batch["input_ids"].to(args.device)
         labels = batch["labels"].to(args.device)
@@ -131,30 +108,11 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
                   f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
             t_step0 = now
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**，unwarp 去前缀。
-        if args.save_interval and (gstep + 1) % args.save_interval == 0 and ddp.is_main():
-            os.makedirs(args.save_dir, exist_ok=True)
-            path = os.path.join(args.save_dir, f"pretrain_e{epoch}_s{gstep+1}.pth")
-            # 存**完整训练状态**（模型 + 三优化器动量 + 步数），续训才能无缝接上；
-            # 只存权重会让 Muon/AdamW/Sinkhorn 动量归零（失忆）。
-            torch.save({
-                "model": ddp.unwrap(model).state_dict(),
-                "muon": muon.state_dict(),
-                "adamw": adamw.state_dict(),
-                "sinkhorn": sinkhorn.state_dict(),
-                "step": gstep + 1,
-            }, path)
-            # 只清理**本次训练自己产生的中间档** `pretrain_e<epoch>_s<step>.pth`。
-            # 曾用 `f.startswith("pretrain_")` → 会连最终产物 `pretrain_e0.pth` 一起匹配删除。
-            # 用正则精确匹配中间档命名，最终产物（无 `_s<step>`）不匹配 → 永不误删。
-            if args.keep_last_n:
-                pat = re.compile(r"^pretrain_e\d+_s\d+\.pth$")
-                cks = sorted(
-                    (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
-                     if pat.match(f)),
-                    key=os.path.getmtime)
-                for old in cks[:-args.keep_last_n]:
-                    os.remove(old)
-            print(f"checkpoint saved at step {gstep+1}", flush=True)
+        if args.save_interval and (gstep + 1) % args.save_interval == 0:
+            save_checkpoint(args.save_dir, "pretrain", epoch, gstep + 1,
+                           model, muon, adamw, sinkhorn, args.keep_last_n)
+            if ddp.is_main():
+                print(f"checkpoint saved at step {gstep+1}", flush=True)
     return total_loss / max(steps, 1), steps
 
 
@@ -186,7 +144,7 @@ def main():
     parser.add_argument("--keep_last_n", type=int, default=3,
                         help="只保留最近 N 个 checkpoint（0=全留）")
     parser.add_argument("--resume", type=str, default=None,
-                        help="从 checkpoint 续训（只恢复模型权重）")
+                        help="从 checkpoint 续训（恢复模型 + 三个优化器动量 + 步数）")
     parser.add_argument("--compile", action="store_true",
                         help="用 torch.compile 加速前向/反向（训练用；推理对拍走 eager 保逐位一致）")
     parser.add_argument("--compile_mode", type=str, default="default",
@@ -242,42 +200,8 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     start_step = 0
     if args.resume:
-        # 续训：恢复**完整训练状态**（模型 + 三优化器动量 + 步数），无缝接上。
-        # 旧格式（仅权重）向后兼容：步数从文件名解析，优化器动量无法恢复（只能从零起）。
-        ck = torch.load(args.resume, map_location=args.device)
-        if isinstance(ck, dict) and "model" in ck:
-            model.load_state_dict(ck["model"])
-            start_step = int(ck.get("step", 0))
-            muon.load_state_dict(ck["muon"])
-            adamw.load_state_dict(ck["adamw"])
-            sinkhorn.load_state_dict(ck["sinkhorn"])
-            print(f"从 {args.resume} 续训，起始 step {start_step}（含三优化器动量）", flush=True)
-        else:
-            model.load_state_dict(ck)
-            m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
-            start_step = int(m.group(1)) if m else 0
-            print(f"从 {args.resume} 续训，起始 step {start_step}（旧格式：仅权重，优化器从零）",
-                  flush=True)
-    # DDP 包装：**必须在 make_optimizers 之后**（否则 named_parameters 带 `module.` 前缀
-    # → 按名路由的优化器分组失效）。find_unused_parameters=True：MoE 每步有未激活专家。
-    model = ddp.wrap(model)
-    for epoch in range(epochs_to_run):
-        ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
-        # DDP 下各 rank 数据量可能不等 → 固定步数（否则先耗尽者退出循环致 all_reduce 死锁）。
-        ep_steps = max_steps
-        if ddp.is_distributed() and ep_steps is None:
-            ep_steps = max(ds.num_rows // args.batch_size // ddp.world_size(), 1)
-        loss, n = train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args,
-                              start_step=start_step, max_steps=ep_steps)
-        start_step += n   # 跨 epoch 累加：lr 余弦调度与 checkpoint 间隔都按全局步数
-        if ddp.is_main():
-            print(f"epoch {epoch} done, avg loss {loss:.4f}（累计 {start_step} 步）")
-            torch.save(ddp.unwrap(model).state_dict(),
-                       os.path.join(args.save_dir, f"pretrain_e{epoch}.pth"))
-    ddp.barrier()
-    ddp.cleanup()
+        _st = load_resume_ckpt(args.resume, model, args.device)
+        start_step = _st["step"]
+        resume_ck = _st
+        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
 
-
-if __name__ == "__main__":
-    # 多进程启动：单卡时直接跑；多卡时 spawn（notebook / 无 torchrun 环境也能用）。
-    ddp.launch(main)

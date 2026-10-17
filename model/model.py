@@ -9,13 +9,12 @@ embed → 复制成 hc_mult 份残差流 → N 层 Block（含 Engram 注入）�
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from model.layers.attention import Attention, SharedAttentionRuntime
 from model.layers.engram import Engram
 from model.layers.engram_hash import EngramHash
-from model.nn.linear import Head, Linear
+from model.nn.linear import Head
 from model.layers.mhc import HyperConnection
 from model.layers.moe import MoE
 from model.nn.norm import RMSNorm
@@ -242,7 +241,7 @@ class Model(nn.Module):
         self.eval()
         ids = input_ids
         for _ in range(max_new_tokens):
-            logits, _ = self.forward(ids)          # 每次前向重置 shared，重新算
+            logits, _ = self.forward(ids)
             next_logits = logits[:, -1, :] / max(temperature, 1e-5)
             if temperature == 0:
                 nxt = next_logits.argmax(dim=-1, keepdim=True)

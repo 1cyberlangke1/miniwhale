@@ -9,7 +9,7 @@ batch 可开越大。**桶按长度升序链式续训**（小桶 → 大桶，�
 输入：
   --data       输入 parquet（列 conversations + image_bytes；文本行 image_bytes 为 null）或 jsonl
   --buckets    桶上界（升序整数），默认 512 768 1024
-  --out_dir    输出目录（默认 dataset/sft_buckets）
+  --out_dir    输出目录（默认本地数据目录下的 sft_buckets）
   --chunk / --limit / --workers / --seed
 输出：
   out_dir/bucket_<N>.parquet   每桶一个（列 conversations + image_bytes，原样保留）
@@ -33,9 +33,6 @@ import pyarrow.parquet as pq
 # 每张图在 LLM 侧占的视觉 span token：1(start) + (w+1)*h(newline) + 1(end)。
 # 本仓库图 256×256 / patch 14 / downsample 3 → 6×6 → 1 + 7*6 + 1 = 44。
 VISION_SPAN = 44
-
-_SCHEMA = pa.schema([("conversations", pa.large_string()),
-                     ("image_bytes", pa.large_binary())])
 
 _TOK = None          # worker 进程内缓存（initializer 里建一次）
 

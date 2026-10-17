@@ -132,6 +132,22 @@ class PretrainDataset(IterableDataset):
         return self.num_rows
 
 
+def collate_fn(batch):
+    """把多模态样本列表拼成 batch；图像 span 保持为 list（每样本的图像输入）。
+
+    输入：样本 dict 列表，每项含 input_ids/labels/token_types/images。
+    输出：{"input_ids":[B,L], "labels":[B,L], "token_types":[B,L], "images": list[list]}。
+    预期行为：张量字段 stack；images 是长度不定的嵌套 list（含 ImageInput 对象），
+              不能 stack，原样保留。
+    """
+    return {
+        "input_ids": torch.stack([b["input_ids"] for b in batch]),
+        "labels": torch.stack([b["labels"] for b in batch]),
+        "token_types": torch.stack([b["token_types"] for b in batch]),
+        "images": [b["images"] for b in batch],
+    }
+
+
 class SFTDataset(IterableDataset):
     """SFT 数据集（jsonl，多轮对话）——**流式**读取，不整表载入。
 

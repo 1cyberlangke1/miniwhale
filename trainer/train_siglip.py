@@ -10,9 +10,7 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -33,25 +31,11 @@ from model.train import ddp
 from model.train.data import ImageTextPairDataset, PreprocessedPairDataset
 from model.train.siglip import SigLIP
 from model.train.compile import maybe_compile
+from model.train.checkpoint import load_resume_ckpt, save_checkpoint
 from model.train.logfile import setup_log_file
+from model.train.scheduler import get_lr
 from model.train.optim import make_optimizers, set_base_lr
 from model.tokenizer import load_tokenizer
-
-
-def get_lr(step, total_steps, warmup_steps, base_lr, min_lr):
-    """余弦学习率调度（带线性 warmup）。
-
-    输入：step 当前步；total_steps 总步数；warmup_steps 预热步数；base_lr 峰值 lr；min_lr 最低 lr。
-    输出：本步的 lr。
-    预期行为：前 warmup_steps 步从 base_lr/10 线性升到 base_lr；之后按余弦从 base_lr 衰减到 min_lr。
-    """
-    if step < warmup_steps:
-        return base_lr * (0.1 + 0.9 * step / max(warmup_steps, 1))
-    if step >= total_steps:
-        return min_lr
-    ratio = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-    cos = 0.5 * (1.0 + math.cos(math.pi * ratio))
-    return min_lr + (base_lr - min_lr) * cos
 
 
 def collate_fn(batch):
@@ -131,27 +115,11 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
                   f"lr {adamw.param_groups[0]['lr']:.2e} "
                   f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
             t_step0 = now
-        if args.save_interval and (gstep + 1) % args.save_interval == 0 and ddp.is_main():
-            os.makedirs(args.save_dir, exist_ok=True)
-            torch.save({
-                "model": ddp.unwrap(model).state_dict(),
-                "muon": muon.state_dict(),
-                "adamw": adamw.state_dict(),
-                "sinkhorn": sinkhorn.state_dict(),
-                "step": gstep + 1,
-            }, os.path.join(args.save_dir, f"vit_siglip_s{gstep+1}.pth"))
-            # 只清理**本次训练自己产生的中间档** `vit_siglip_s<step>.pth`。
-            # 曾用 `f.startswith("vit_siglip_")` → 会连最终产物 `vit_siglip.pth` 一起匹配删除。
-            # 用正则精确匹配中间档命名，最终产物（无 `_s<step>`）不匹配 → 永不误删。
-            if args.keep_last_n:
-                pat = re.compile(r"^vit_siglip_s\d+\.pth$")
-                cks = sorted(
-                    (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
-                     if pat.match(f)),
-                    key=os.path.getmtime)
-                for old in cks[:-args.keep_last_n]:
-                    os.remove(old)
-            print(f"checkpoint saved at step {gstep+1}", flush=True)
+        if args.save_interval and (gstep + 1) % args.save_interval == 0:
+            save_checkpoint(args.save_dir, "siglip", epoch, gstep + 1,
+                           model, muon, adamw, sinkhorn, args.keep_last_n)
+            if ddp.is_main():
+                print(f"checkpoint saved at step {gstep+1}", flush=True)
     return total_loss / max(steps, 1), steps
 
 
@@ -217,15 +185,9 @@ def main():
     # 续训：恢复完整训练状态（模型 + 三优化器动量 + 步数）。优化器在下方才创建，先暂存待回填。
     start_step, resume_ck = 0, None
     if args.resume:
-        ck = torch.load(args.resume, map_location=args.device)
-        if isinstance(ck, dict) and "model" in ck:
-            model.load_state_dict(ck["model"])
-            start_step = int(ck.get("step", 0))
-            resume_ck = ck
-        else:
-            model.load_state_dict(ck)
-            m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
-            start_step = int(m.group(1)) if m else 0
+        _st = load_resume_ckpt(args.resume, model, args.device)
+        start_step = _st["step"]
+        resume_ck = _st
         print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
 

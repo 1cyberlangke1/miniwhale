@@ -8,14 +8,13 @@ CSA：只有 kv_source 层用自己的输入算压缩 KV 并发布；后续层**
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from model.layers.compressor import Compressor
-from model.layers.indexer import Indexer, IndexerLossAutoScaler, select_candidate_blocks
+from model.layers.indexer import Indexer, IndexerLossAutoScaler
 from model.nn.norm import RMSNorm
 from model.nn.quant import fake_quant_compressed_kv, fake_quant_fp4, fake_quant_fp8
 from model.nn.rope import apply_rotary_emb
@@ -97,8 +96,6 @@ class Attention(nn.Module):
 
         self.is_kv_source = is_backbone and layer_id in text_cfg.kv_source_layer_ids
         self.is_index_source = is_backbone and layer_id in text_cfg.index_source_layer_ids
-        self.is_candidate_source = layer_id == text_cfg.candidate_source_layer_id
-        self.uses_candidates = 0 <= text_cfg.candidate_source_layer_id < layer_id
 
         self.compressor = Compressor(text_cfg, layer_id) if self.is_kv_source else None
         self.indexer = Indexer(text_cfg, layer_id) if self.is_index_source else None
@@ -184,7 +181,7 @@ class Attention(nn.Module):
         kv = fake_quant_fp8(kv, block_size=32, pow2=True)
         win = self.window_size
         if start_pos == 0:
-            # 训练/prefill 直接用 kv（不写缓存，避免破坏计算图）；decode 才需要缓存
+            # 训练/prefill 计算走 kv 本身，同时把 detached 副本写进窗口缓存供后续 decode 读
             if seqlen <= win:
                 with torch.no_grad():
                     self.window_kv_cache[:bsz, :seqlen] = kv.detach()
@@ -245,7 +242,6 @@ class Attention(nn.Module):
         若把 exp 留 fp32、或先归一化再算 PV，会与参考实现差 ~1e-2（bf16 舍入点不同）。
         """
         b, L, H, D = q.shape
-        T = kv.size(1)
         K = idxs.size(-1)
         qf = q.float()
         # gather KV: [B,L,K,D]。用沿 T 维的 gather（index 直接是 [B,L*K]），**不造**

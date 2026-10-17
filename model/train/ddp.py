@@ -134,18 +134,6 @@ def barrier() -> None:
         dist.barrier()
 
 
-def shard_index_info() -> tuple[int, int]:
-    """返回本进程的 (shard_index, shard_count)，用于 IterableDataset 的 DDP 分片。
-
-    输入：无。
-    输出：(idx, n)。idx ∈ [0, n)，本进程应取的切片下标；n = world_size（非分布式时 n=1）。
-    预期行为：**非分布式时返回 (0, 1)** → 数据集切分退化为原样（单卡逐位不变）。
-              分布式时 idx = rank，各 rank 取不同切片、互不重叠。
-              调用方负责再叠加 worker 维度（见 shard_worker_index）。
-    """
-    return get_rank(), (int(os.environ.get("WORLD_SIZE", "1")) if is_distributed() else 1)
-
-
 def world_size() -> int:
     """当前进程组大小（非分布式时为 1）。"""
     return int(os.environ.get("WORLD_SIZE", "1")) if is_distributed() else 1

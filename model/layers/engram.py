@@ -3,7 +3,6 @@
 用哈希 id 取表行，投影成「每个 hc 副本一个 key + 一个共享 value」，
 门控 = 残差流与 key 的归一化点积，加性写回全部 hc 副本。
 表很大但只有命中的行有梯度（稀疏更新）。
-表按参考实现 ParallelEngramEmbedding 以 **FP8 存储 + 块 scale**（查表时反量化）。
 """
 
 from __future__ import annotations
@@ -18,13 +17,13 @@ FP8_BLOCK = 32  # 参考实现 fp8_block_size：一个 scale 管 32 个元素
 
 
 class EngramTable(nn.Module):
-    """n-gram 哈希表：FP8 存储 + 逐行 e8m0 scale（按参考实现 ParallelEngramEmbedding）。
+    """n-gram 哈希表：fp32 master 权重，查表转 bf16。
 
     输入：indices [..., ]（哈希行号）。
-    输出：[..., dim]（bf16，反量化后的行）。
-    预期行为：权重存 **fp8_e4m3fn**、每行一个 **e8m0** scale（与参考实现 checkpoint 一致）；
-              查表取 fp8 行与 scale，按参考实现公式反量化。梯度经 autograd 直通回 master
-              （fp8 参数本身不可反传，故用 fp32 master 存值、前向量化成 fp8 存储语义）。
+    输出：[..., dim]（bf16）。
+    预期行为：权重以 fp32 master 存储（可训练），前向直接查表并转 bf16。
+              参考实现 checkpoint 里表存 fp8 + block scale，但那是推理格式；
+              训练路径不做额外量化（再做一次会造成训练/推理数值分叉）。
     """
 
     def __init__(self, num_embeddings: int, dim: int, block_size: int = FP8_BLOCK):
@@ -40,22 +39,6 @@ class EngramTable(nn.Module):
     def reset_parameters(self):
         """初始化：正态小值。"""
         self.weight.copy_(torch.randn(self.num_embeddings, self.dim) * 0.02)
-
-    def _quantize_rows(self, rows: torch.Tensor):
-        """按参考实现公式把 fp32 行量化成 fp8 + e8m0 scale（**每 block_size 个元素一个 scale**）。
-
-        输入：rows [..., dim] fp32。
-        输出：(fp8 [..., dim], scale [..., dim // block_size] e8m0)。
-        预期行为：amax 按 **block**（dim 方向切 block_size）取、clamp_min(1e-4)；
-                  scale = 2^ceil(log2(amax/448))（e8m0）。按参考实现 ParallelEngramEmbedding：
-                  scale 是 block-wise（dim // fp8_block_size），不是每行一个。
-        """
-        bs = self.block_size
-        blocks = rows.unflatten(-1, (-1, bs))                           # [..., dim//bs, bs]
-        amax = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)  # [..., dim//bs, 1]
-        scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))        # e8m0
-        quant = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-        return quant.flatten(-2), scale.squeeze(-1)                     # [...,dim], [...,dim//bs]
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """查表（训练/推理**同一条**路径）。

@@ -10,9 +10,7 @@ loss：与纯文本一致（只对非 -100 位置），但图像位置参与前�
 from __future__ import annotations
 
 import argparse
-import math
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -30,43 +28,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
 from model.train import ddp
-from model.train.data import MultimodalDataset
+from model.train.data import collate_fn, MultimodalDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
+from model.train.checkpoint import load_resume_ckpt, save_checkpoint
 from model.train.logfile import setup_log_file
+from model.train.scheduler import get_lr
 from model.train.optim import make_optimizers, set_base_lr
 from model.tokenizer import load_tokenizer
-
-
-def get_lr(step, total_steps, warmup_steps, base_lr, min_lr):
-    """余弦学习率调度（带线性 warmup）。
-
-    输入：step 当前步；total_steps 总步数；warmup_steps 预热步数；base_lr 峰值 lr；min_lr 最低 lr。
-    输出：本步的 lr。
-    预期行为：前 warmup_steps 步从 base_lr/10 线性升到 base_lr；之后按余弦从 base_lr 衰减到 min_lr。
-    """
-    if step < warmup_steps:
-        return base_lr * (0.1 + 0.9 * step / max(warmup_steps, 1))
-    if step >= total_steps:
-        return min_lr
-    ratio = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-    cos = 0.5 * (1.0 + math.cos(math.pi * ratio))
-    return min_lr + (base_lr - min_lr) * cos
-
-
-def collate_fn(batch):
-    """把样本列表拼成 batch；图像 span 保持为 list（每样本的图像输入）。
-
-    输入：样本 dict 列表。
-    输出：{"input_ids":[B,L], "labels":[B,L], "token_types":[B,L], "images": list[list]}。
-    """
-    input_ids = torch.stack([b["input_ids"] for b in batch])
-    labels = torch.stack([b["labels"] for b in batch])
-    token_types = torch.stack([b["token_types"] for b in batch])
-    images = [b["images"] for b in batch]
-    return {"input_ids": input_ids, "labels": labels,
-            "token_types": token_types, "images": images}
 
 
 def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
@@ -134,30 +104,11 @@ def train_epoch(epoch, loader, model, muon, adamw, sinkhorn, args, start_step=0,
                   f"{(now - t_step0) * 1000:.0f}ms/step", flush=True)
             t_step0 = now
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**，避免多进程争抢。
-        if args.save_interval and (gstep + 1) % args.save_interval == 0 and ddp.is_main():
-            os.makedirs(args.save_dir, exist_ok=True)
-            path = os.path.join(args.save_dir, f"vlm_e{epoch}_s{gstep+1}.pth")
-            # 存**完整训练状态**（模型 + 三优化器动量 + 步数），续训才能无缝接上；
-            # 只存权重会让优化器动量归零（失忆）。unwarp 去 `module.` 前缀，与单卡兼容。
-            torch.save({
-                "model": ddp.unwrap(model).state_dict(),
-                "muon": muon.state_dict(),
-                "adamw": adamw.state_dict(),
-                "sinkhorn": sinkhorn.state_dict(),
-                "step": gstep + 1,
-            }, path)
-            if args.keep_last_n:
-                # 只清理**本次训练自己产生的中间档** `vlm_e<epoch>_s<step>.pth`。
-                # 曾用 `f.startswith("vlm_")` → 会连桶快照 `vlm_384.pth` 一起匹配删除（事故）。
-                # 用正则精确匹配中间档命名，桶快照（vlm_<bucket>.pth）不匹配 → 永不误删。
-                pat = re.compile(r"^vlm_e\d+_s\d+\.pth$")
-                cks = sorted(
-                    (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
-                     if pat.match(f)),
-                    key=os.path.getmtime)
-                for old in cks[:-args.keep_last_n]:
-                    os.remove(old)
-            print(f"checkpoint saved at step {gstep+1}", flush=True)
+        if args.save_interval and (gstep + 1) % args.save_interval == 0:
+            save_checkpoint(args.save_dir, "vlm", epoch, gstep + 1,
+                           model, muon, adamw, sinkhorn, args.keep_last_n)
+            if ddp.is_main():
+                print(f"checkpoint saved at step {gstep+1}", flush=True)
     return total_loss / max(steps, 1), steps
 
 
@@ -236,16 +187,9 @@ def main():
     # 故此处先暂存 checkpoint，待 make_optimizers 后回填。
     start_step, resume_ck = 0, None
     if args.resume:
-        ck = torch.load(args.resume, map_location=args.device)
-        if isinstance(ck, dict) and "model" in ck:
-            model.load_state_dict(ck["model"])
-            start_step = int(ck.get("step", 0))
-            resume_ck = ck
-        else:
-            # 旧格式（仅权重）：向后兼容，步数从文件名解析
-            model.load_state_dict(ck)
-            m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
-            start_step = int(m.group(1)) if m else 0
+        _st = load_resume_ckpt(args.resume, model, args.device)
+        start_step = _st["step"]
+        resume_ck = _st
         print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
     assert model.vision is not None, "模型未启用视觉塔"

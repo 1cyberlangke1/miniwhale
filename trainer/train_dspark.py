@@ -15,9 +15,7 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -39,24 +37,10 @@ from model.train.data import PretrainDataset
 from model.train.dspark_loss import compute_dspark_loss
 from model.model import Model
 from model.train.compile import maybe_compile
+from model.train.checkpoint import load_resume_ckpt, save_checkpoint
 from model.train.logfile import setup_log_file
+from model.train.scheduler import get_lr
 from model.tokenizer import load_tokenizer
-
-
-def get_lr(step, total_steps, warmup_steps, base_lr, min_lr):
-    """余弦学习率调度（带线性 warmup）。
-
-    输入：step 当前步；total_steps 总步数；warmup_steps 预热步数；base_lr 峰值 lr；min_lr 最低 lr。
-    输出：本步的 lr。
-    预期行为：前 warmup_steps 步从 base_lr/10 线性升到 base_lr；之后按余弦从 base_lr 衰减到 min_lr。
-    """
-    if step < warmup_steps:
-        return base_lr * (0.1 + 0.9 * step / max(warmup_steps, 1))
-    if step >= total_steps:
-        return min_lr
-    ratio = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
-    cos = 0.5 * (1.0 + math.cos(math.pi * ratio))
-    return min_lr + (base_lr - min_lr) * cos
 
 
 def freeze_backbone(model: Model):
@@ -136,17 +120,10 @@ def main():
     # 续训：恢复完整训练状态（模型 + 优化器动量 + 步数）。只存权重会让 AdamW 一/二阶矩归零。
     start_step, resume_ck = 0, None
     if args.resume:
-        ck = torch.load(args.resume, map_location=args.device)
-        if isinstance(ck, dict) and "model" in ck:
-            model.load_state_dict(ck["model"])
-            start_step = int(ck.get("step", 0))
-            resume_ck = ck
-        else:
-            model.load_state_dict(ck)
-            m = re.search(r"_s(\d+)\.pth$", os.path.basename(args.resume))
-            start_step = int(m.group(1)) if m else 0
-        if resume_ck is not None:
-            opt.load_state_dict(resume_ck["opt"])
+        _st = load_resume_ckpt(args.resume, model, args.device)
+        start_step = _st["step"]
+        if _st["muon"] is not None:
+            opt.load_state_dict(_st["muon"])
         print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
     # DDP 包装：**必须在 freeze_backbone + opt 建立之后**（否则 trainable 列表与按名路由
     # 会带 `module.` 前缀而失效）。DSpark 冻结主干只训 draft 头，梯度同步只覆盖 draft 参数。
@@ -211,28 +188,11 @@ def main():
                   f"lr {opt.param_groups[0]['lr']:.2e} "
                   f"{(time.time() - t_step0) * 1000:.0f}ms/step", flush=True)
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**，unwarp 去前缀。
-        if args.save_interval and (step + 1) % args.save_interval == 0 and ddp.is_main():
-            os.makedirs(args.save_dir, exist_ok=True)
-            path = os.path.join(args.save_dir, f"dspark_s{step+1}.pth")
-            # 存**完整训练状态**（模型 + 优化器动量 + 步数），续训才能无缝接上。
-            torch.save({
-                "model": ddp.unwrap(model).state_dict(),
-                "opt": opt.state_dict(),
-                "step": step + 1,
-            }, path)
-            # 只清理**本次训练自己产生的中间档** `dspark_s<step>.pth`。
-            # 曾用 `f.startswith("dspark_")` → 会连最终产物 `dspark.pth` 一起匹配删除。
-            # 用正则精确匹配中间档命名，最终产物（无 `_s<step>`）不匹配 → 永不误删。
-            if args.keep_last_n:
-                pat = re.compile(r"^dspark_s\d+\.pth$")
-                cks = sorted(
-                    (os.path.join(args.save_dir, f) for f in os.listdir(args.save_dir)
-                     if pat.match(f)),
-                    key=os.path.getmtime)
-                for old in cks[:-args.keep_last_n]:
-                    os.remove(old)
-            print(f"checkpoint saved at step {step+1}", flush=True)
-
+        if args.save_interval and (step + 1) % args.save_interval == 0:
+            save_checkpoint(args.save_dir, "dspark", epoch, step + 1,
+                           model, muon, adamw, sinkhorn, args.keep_last_n)
+            if ddp.is_main():
+                print(f"checkpoint saved at step {step+1}", flush=True)
     if ddp.is_main():
         os.makedirs(args.save_dir, exist_ok=True)
         torch.save(ddp.unwrap(model).state_dict(), os.path.join(args.save_dir, "dspark.pth"))
