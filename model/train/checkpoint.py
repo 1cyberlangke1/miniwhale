@@ -19,6 +19,7 @@ def save_checkpoint(save_dir: str, prefix: str, epoch: int, step: int, model, mu
     """保存完整训练状态并清理旧的中间档。
 
     输入：save_dir；prefix（如 "sft"）；epoch；step（已 +1）；三个优化器；keep_last_n（0=全留）。
+          优化器可为 None（如 DSpark 只有单个 AdamW 时，另两个槽位传 None）——对应键存 None。
     输出：保存路径。
     预期行为：仅 rank0 落盘（其余 rank 直接返回空串）；文件存 model/muon/adamw/sinkhorn/step。
               清理时用正则精确匹配 `<prefix>_e\\d+_s\\d+\\.pth`，**不会**误删最终产物
@@ -30,9 +31,9 @@ def save_checkpoint(save_dir: str, prefix: str, epoch: int, step: int, model, mu
     path = os.path.join(save_dir, f"{prefix}_e{epoch}_s{step}.pth")
     torch.save({
         "model": ddp.unwrap(model).state_dict(),
-        "muon": muon.state_dict(),
-        "adamw": adamw.state_dict(),
-        "sinkhorn": sinkhorn.state_dict(),
+        "muon": muon.state_dict() if muon is not None else None,
+        "adamw": adamw.state_dict() if adamw is not None else None,
+        "sinkhorn": sinkhorn.state_dict() if sinkhorn is not None else None,
         "step": step,
     }, path)
     if keep_last_n:

@@ -231,21 +231,34 @@ class Model(nn.Module):
                 gate.update_bias(rate)
 
     @torch.no_grad()
-    def generate(self, input_ids, max_new_tokens: int = 16, temperature: float = 0.0):
+    def generate(self, input_ids, max_new_tokens: int = 16, temperature: float = 0.0,
+                 eos_token_id: int | None = None):
         """自回归生成（贪心或采样）。
 
-        输入：input_ids [B, L0]；max_new_tokens；temperature（0=贪心）。
-        输出：[B, L0+max_new_tokens]。
-        预期行为：逐 token 前向，取最后一个位置的 logits 采样，拼到序列尾。
+        输入：input_ids [B, L0]；max_new_tokens；temperature（0=贪心）；
+              eos_token_id（None=不提前停止）。
+        输出：[B, L0+max_new_tokens]（提前停止时更短）。
+        预期行为：逐 token 前向，取最后一个位置的 logits 采样，拼到序列尾；
+                  temperature>0 用 Gumbel-max 等价采样（与参考实现同一算法，
+                  softmax 用 fp32 计算）；给 eos 且**所有**序列都生成出 eos 时提前结束。
+                  小模型上贪心会陷入复读循环，采样才能跳出。
         """
         self.eval()
         ids = input_ids
+        done = torch.zeros(ids.size(0), dtype=torch.bool, device=ids.device)
         for _ in range(max_new_tokens):
             logits, _ = self.forward(ids)
             next_logits = logits[:, -1, :] / max(temperature, 1e-5)
             if temperature == 0:
                 nxt = next_logits.argmax(dim=-1, keepdim=True)
             else:
-                nxt = torch.multinomial(next_logits.softmax(-1), 1)
+                # Gumbel-max：probs / Exp(1) 的 argmax，与多项分布采样同分布
+                probs = torch.softmax(next_logits, dim=-1, dtype=torch.float32)
+                nxt = probs.div_(torch.empty_like(probs).exponential_(1)).argmax(
+                    dim=-1, keepdim=True)
             ids = torch.cat([ids, nxt], dim=1)
+            if eos_token_id is not None:
+                done |= nxt.squeeze(1) == eos_token_id
+                if done.all():
+                    break
         return ids

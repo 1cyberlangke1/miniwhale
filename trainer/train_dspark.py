@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
 from model.train import ddp
+from model.train.cli import add_common_args, apply_defaults
 from model.train.data import PretrainDataset
 from model.train.dspark_loss import compute_dspark_loss
 from model.model import Model
@@ -64,37 +65,21 @@ def main():
     ap = argparse.ArgumentParser(description="miniwhale DSpark 训练")
     ap.add_argument("--data_path", default="dataset/pretrain_t2t_mini.jsonl")
     ap.add_argument("--ckpt", default=None, help="已训练的 backbone 权重（可选）")
-    ap.add_argument("--resume", default=None,
-                    help="从本阶段中间档续训（dspark_s{STEP}.pth；恢复完整训练状态）")
-    ap.add_argument("--epochs", type=int, default=0, help="训练轮数（默认 0=不跑）")
-    ap.add_argument("--steps", type=int, default=0,
-                    help="按步数训练（默认 0=不跑）；与 --epochs 同时指定时 epoch 优先")
-    ap.add_argument("--seq_len", type=int, default=256)
-    ap.add_argument("--batch", type=int, default=1)
-    ap.add_argument("--lr", type=float, default=6e-4, help="参考实现 lr=6e-4")
-    ap.add_argument("--min_lr", type=float, default=6e-5, help="余弦衰减的最低 lr")
-    ap.add_argument("--warmup_steps", type=int, default=100, help="线性预热步数")
+    ap.add_argument("--batch_size", type=int, default=1)
+    ap.add_argument("--max_seq_len", type=int, default=256)
     ap.add_argument("--router_bias_rate", type=float, default=1e-3,
                     help="noaux_tc 纠正 bias 的更新步长（非梯度）")
-    ap.add_argument("--log_interval", type=int, default=200)
-    ap.add_argument("--save_interval", type=int, default=1000,
-                    help="每多少步存一次 checkpoint（0=不存）")
-    ap.add_argument("--keep_last_n", type=int, default=3,
-                    help="只保留最近 N 个 checkpoint（0=全留）")
-    ap.add_argument("--save_dir", default="out")
-    ap.add_argument("--log_file", default=None,
-                    help="训练日志落盘路径（Python 内直写，不经 shell 管道；None=只打印控制台）")
-    ap.add_argument("--compile", action="store_true",
-                    help="用 torch.compile 加速训练（保持 inductor 默认数值语义）")
-    ap.add_argument("--compile_mode", type=str, default="default",
-                    help='torch.compile 模式（固定 "default"）')
-    ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    add_common_args(ap)
     args = ap.parse_args()
+    # 各阶段默认值（命令行显式给出的参数不受影响）
+    apply_defaults(args, learning_rate=6e-4, min_lr=6e-5, warmup_steps=100,
+                   accumulation_steps=1, num_workers=0)
     # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
     args.device = ddp.setup(args.device)
     if ddp.is_main():
         setup_log_file(args.log_file, append=bool(args.resume))
 
+    torch.manual_seed(args.seed)
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
     # 见 train_pretrain 同名注释：bf16 参数会让 RMSNorm 权重的更新被舍入抹掉。
     tokenizer = load_tokenizer()
@@ -113,12 +98,27 @@ def main():
     trainable = freeze_backbone(model)
     print(f"DSpark 可训练参数 {sum(p.numel() for p in trainable)/1e6:.2f}M")
 
-    ds = PretrainDataset(args.data_path, tokenizer, max_length=args.seq_len)
-    # 数据集是 IterableDataset（流式），自带缓冲打乱，DataLoader 不能再传 shuffle=True
-    loader = DataLoader(ds, batch_size=args.batch, num_workers=0)
-    opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.95))
+    ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    # 训练模式：steps 与 epochs 默认都为 0，不传 = 直接报错不跑（防误触发整轮训练）。
+    if not args.steps and not args.epochs:
+        ap.error("必须显式指定 --epochs 或 --steps（默认都为 0，不跑）")
+    if args.steps and args.epochs:
+        print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
+              f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
+        total_steps = max(len(ds) // args.batch_size // ddp.world_size(), 1) * args.epochs
+    elif args.steps:
+        total_steps = args.steps
+    else:
+        total_steps = max(len(ds) // args.batch_size // ddp.world_size(), 1) * args.epochs
+    args.total_steps = args.total_steps or total_steps
+    print(f"数据集 {len(ds)} 行；总步数 {args.total_steps}（warmup {args.warmup_steps}）",
+          flush=True)
+    loader = DataLoader(ds, batch_size=args.batch_size, num_workers=args.num_workers)
+
+    # 只对 draft 头建优化器（主干冻结）
+    opt = torch.optim.AdamW(trainable, lr=args.learning_rate, betas=(0.9, 0.95))
     # 续训：恢复完整训练状态（模型 + 优化器动量 + 步数）。只存权重会让 AdamW 一/二阶矩归零。
-    start_step, resume_ck = 0, None
+    start_step = 0
     if args.resume:
         _st = load_resume_ckpt(args.resume, model, args.device)
         start_step = _st["step"]
@@ -130,26 +130,14 @@ def main():
     model = ddp.wrap(model)
     model.train()
 
-    # 训练模式：steps 与 epochs 默认都为 0。两者互斥——同时指定时 epoch 优先（打印提醒）。
-    # 默认全 0 且不传 = 直接报错不跑（防止误触发整轮训练）。
-    if not args.steps and not args.epochs:
-        ap.error("必须显式指定 --epochs 或 --steps（默认都为 0，不跑）")
-    if args.steps and args.epochs:
-        print(f"提醒：--steps={args.steps} 与 --epochs={args.epochs} 同时指定，"
-              f"按 epoch 优先（跑 {args.epochs} 轮，忽略 --steps）", flush=True)
-        total_steps = max(len(ds) // args.batch // ddp.world_size(), 1) * args.epochs
-    elif args.steps:
-        total_steps = args.steps
-    else:
-        total_steps = max(len(ds) // args.batch, 1) * args.epochs
-
+    os.makedirs(args.save_dir, exist_ok=True)
     tc = cfg.text
     epoch = 0
     ds.set_epoch(epoch)  # 流式数据集：每轮换 seed 重排数据顺序
     it = iter(loader)
-    for step in range(start_step, total_steps):
+    for step in range(start_step, args.total_steps):
         t_step0 = time.time()   # 每步起点：打印**瞬时**耗时（非累计均值），看清稳态速度
-        lr = get_lr(step, total_steps, args.warmup_steps, args.lr, args.min_lr)
+        lr = get_lr(step, args.total_steps, args.warmup_steps, args.learning_rate, args.min_lr)
         for g in opt.param_groups:
             g["lr"] = lr
         try:
@@ -182,19 +170,20 @@ def main():
         ddp.unwrap(model).update_router_bias(args.router_bias_rate)
         if step % args.log_interval == 0 and ddp.is_main():
             # 分项（未加权）便于看清哪一项在动/卡住：CE 学预测、L1 贴主干分布、conf 校准接受率。
-            print(f"dspark step {step}/{total_steps} loss {loss.item():.4f} "
+            print(f"dspark step {step}/{args.total_steps} loss {loss.item():.4f} "
                   f"ce {loss_parts['ce'].item():.4f} l1 {loss_parts['l1'].item():.4f} "
                   f"conf {loss_parts['conf'].item():.4f} "
                   f"lr {opt.param_groups[0]['lr']:.2e} "
                   f"{(time.time() - t_step0) * 1000:.0f}ms/step", flush=True)
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**，unwarp 去前缀。
+        # DSpark 只有**一个** AdamW 优化器（主干冻结），故复用 save_checkpoint 的三优化器
+        # 槽位：muon 存 AdamW 状态，adamw/sinkhorn 传 None（加载侧按 muon 取回）。
         if args.save_interval and (step + 1) % args.save_interval == 0:
             save_checkpoint(args.save_dir, "dspark", epoch, step + 1,
-                           model, muon, adamw, sinkhorn, args.keep_last_n)
+                            model, opt, None, None, args.keep_last_n)
             if ddp.is_main():
                 print(f"checkpoint saved at step {step+1}", flush=True)
     if ddp.is_main():
-        os.makedirs(args.save_dir, exist_ok=True)
         torch.save(ddp.unwrap(model).state_dict(), os.path.join(args.save_dir, "dspark.pth"))
         print("DSpark 训练完成")
     ddp.barrier()
