@@ -102,7 +102,7 @@ class Model(nn.Module):
             self.image_newline = nn.Parameter(torch.randn(tc.hidden_size) * 0.02)
 
     def forward(self, input_ids, start_pos=0, token_mask=None, images=None, token_types=None,
-                full_logits=True, dspark_train=None):
+                full_logits=True, dspark_train=None, past_ids=None):
         """主干前向（按参考实现 Transformer.forward 的 VL 接口）。
 
         输入：input_ids [B,L]；start_pos；token_mask [B,L]（False=图像位置，Engram 跳过）；
@@ -110,7 +110,9 @@ class Model(nn.Module):
               token_types [B,L]（TEXT=-1，非负为图像位置类型）；
               full_logits=False 时只算末位置（按参考实现 ParallelHead，推理/对拍用；训练需全序列）；
               dspark_train：None=不算 DSpark（默认，推理/对拍路径不变）；给定 dict（含
-              "loss_mask"）则在**本前向内**额外算 DSpark 训练前向，输出随 forward 返回。
+              "loss_mask"）则在**本前向内**额外算 DSpark 训练前向，输出随 forward 返回；
+              past_ids [B,P]：decode（start_pos>0）时的**真实历史 token**，供 Engram 的
+              n-gram 哈希回看（不传则 start_pos>0 且启用 Engram 时报错）。
         输出：dspark_train=None → (logits [B,L,V] 或 full_logits=False 时 [B,V], hidden [B,L,dim])；
               dspark_train 给定 → 三元组 (logits, hidden, dspark_out)。
         预期行为：图像 span 的占位位置被替换为 ViT/Aligner 特征与分隔符嵌入，再走主干。
@@ -133,7 +135,16 @@ class Model(nn.Module):
 
         engram_hashes = None
         if self.engram_hash is not None:
-            engram_hashes = self.engram_hash(input_ids, engram_mask)  # [B,L,n_layers,n_hash_cols]
+            # decode（start_pos>0）时必须补真实历史：n-gram 要回看前 M-1 个 token，
+            # 只喂 1 个 token 会退化成「单 token + 全 pad」，与全量重算完全不同。
+            # 历史取 input_ids 之前的位置——由调用方通过 `past_ids` 传入（见 generate）。
+            prefix_ids = None
+            if start_pos > 0:
+                assert past_ids is not None, (
+                    "start_pos>0 时必须传 past_ids（decode 的历史 token），否则 Engram "
+                    "n-gram 哈希与全量重算不一致")
+                prefix_ids = past_ids
+            engram_hashes = self.engram_hash(input_ids, engram_mask, prefix_ids)  # [B,L,n_layers,n_hash_cols]
 
         h = self.embed(input_ids)                       # [B,L,dim]
         if images is not None:
@@ -231,34 +242,68 @@ class Model(nn.Module):
                 gate.update_bias(rate)
 
     @torch.no_grad()
+    def reset_cache(self):
+        """清空所有跨序列状态（新对话开始前调用）。
+
+        输入：无。
+        输出：无。
+        预期行为：每层的滑窗 KV 环、压缩 KV、index K 缓存与 Compressor 的跨步状态全部归零，
+                  并清空跨层共享槽。**不调用就换序列**会让新序列读到上一段的 KV（输出串味）。
+                  训练路径不读这些缓存（prefill 直接算），故无需在 train_epoch 里调。
+        """
+        for layer in self.layers:
+            if hasattr(layer.attn, "reset_cache"):
+                layer.attn.reset_cache()
+        self.shared = SharedAttentionRuntime()
+
+    @torch.no_grad()
     def generate(self, input_ids, max_new_tokens: int = 16, temperature: float = 0.0,
                  eos_token_id: int | None = None):
-        """自回归生成（贪心或采样）。
+        """自回归生成（贪心或采样，**增量解码**）。
 
         输入：input_ids [B, L0]；max_new_tokens；temperature（0=贪心）；
               eos_token_id（None=不提前停止）。
         输出：[B, L0+max_new_tokens]（提前停止时更短）。
-        预期行为：逐 token 前向，取最后一个位置的 logits 采样，拼到序列尾；
+        预期行为：先 prefill 一次（start_pos=0，同时填充滑窗/压缩 KV 缓存），
+                  之后每步只喂**新 token**（start_pos=已生成长度），走增量路径——
+                  复杂度从 O(L²) 降到 O(L·window_size)。
                   temperature>0 用 Gumbel-max 等价采样（与参考实现同一算法，
                   softmax 用 fp32 计算）；给 eos 且**所有**序列都生成出 eos 时提前结束。
-                  小模型上贪心会陷入复读循环，采样才能跳出。
+                  **开头自动 reset_cache**：新对话不能读到上一段的 KV。
         """
         self.eval()
+        self.reset_cache()
         ids = input_ids
-        done = torch.zeros(ids.size(0), dtype=torch.bool, device=ids.device)
-        for _ in range(max_new_tokens):
-            logits, _ = self.forward(ids)
-            next_logits = logits[:, -1, :] / max(temperature, 1e-5)
-            if temperature == 0:
-                nxt = next_logits.argmax(dim=-1, keepdim=True)
-            else:
-                # Gumbel-max：probs / Exp(1) 的 argmax，与多项分布采样同分布
-                probs = torch.softmax(next_logits, dim=-1, dtype=torch.float32)
-                nxt = probs.div_(torch.empty_like(probs).exponential_(1)).argmax(
-                    dim=-1, keepdim=True)
+        L0 = ids.size(1)
+        # prefill：整段前向一次，KV 缓存写入滑窗环与压缩缓存
+        logits, _ = self.forward(ids, start_pos=0, full_logits=False)
+        next_logits = logits / max(temperature, 1e-5)
+        nxt = self._sample(next_logits, temperature)
+        ids = torch.cat([ids, nxt], dim=1)
+        done = nxt.squeeze(1) == eos_token_id if eos_token_id is not None else None
+        # decode：每步只喂 1 个 token；past_ids 传完整历史（Engram 的 n-gram 要回看）
+        for _ in range(max_new_tokens - 1):
+            if done is not None and done.all():
+                break
+            logits, _ = self.forward(nxt, start_pos=ids.size(1) - 1, full_logits=False,
+                                     past_ids=ids[:, :-1])
+            next_logits = logits / max(temperature, 1e-5)
+            nxt = self._sample(next_logits, temperature)
             ids = torch.cat([ids, nxt], dim=1)
-            if eos_token_id is not None:
+            if done is not None:
                 done |= nxt.squeeze(1) == eos_token_id
-                if done.all():
-                    break
         return ids
+
+    @staticmethod
+    def _sample(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+        """从 logits 采一个 token。
+
+        输入：logits [B, V]；temperature（0=贪心）。
+        输出：[B, 1]。
+        预期行为：temperature>0 用 Gumbel-max（probs / Exp(1) 的 argmax，fp32 softmax），
+                  与多项分布采样同分布，且与参考实现同一算法。
+        """
+        if temperature == 0:
+            return logits.argmax(dim=-1, keepdim=True)
+        probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        return probs.div_(torch.empty_like(probs).exponential_(1)).argmax(dim=-1, keepdim=True)

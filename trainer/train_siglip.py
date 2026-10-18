@@ -26,11 +26,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
 from model.train import ddp
-from model.train.cli import add_common_args, apply_defaults
+from model.train.cli import add_common_args, apply_defaults, resolve_resume
 from model.train.data import ImageTextPairDataset, PreprocessedPairDataset
 from model.train.siglip import SigLIP
 from model.train.compile import maybe_compile
-from model.train.checkpoint import load_resume_ckpt
+from model.train.checkpoint import _atomic_save, load_resume_ckpt
 from model.train.logfile import setup_log_file
 from model.train.loop import (build_loaders_and_steps, run_epochs)
 from model.train.optim import make_optimizers
@@ -82,7 +82,7 @@ def main():
     # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
     args.device = ddp.setup(args.device)
     if ddp.is_main():
-        setup_log_file(args.log_file, append=bool(args.resume))
+        setup_log_file(args.log_file, append=bool(args.resume or args.from_resume))
 
     torch.manual_seed(args.seed)
     # 参数保持 fp32 主权重；计算走 bf16 autocast（同其它训练入口）。
@@ -95,11 +95,12 @@ def main():
     model.cfg = cfg
     # 续训：恢复完整训练状态（模型 + 三优化器动量 + 步数）。优化器在下方才创建，先暂存待回填。
     start_step, resume_ck = 0, None
-    if args.resume:
-        _st = load_resume_ckpt(args.resume, model, args.device)
+    resume_path = resolve_resume(args, "siglip")
+    if resume_path:
+        _st = load_resume_ckpt(resume_path, model, args.device)
         start_step = _st["step"]
         resume_ck = _st
-        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
+        print(f"从 {resume_path} 续训，起始 step {start_step}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
 
     # 预处理目录（含 meta.json）：读离线张量，零现场解码；否则现场从 parquet 解码。
@@ -171,10 +172,10 @@ def main():
     if ddp.is_main():
         raw = ddp.unwrap(model)
         # 只留视觉编码器（参考实现：丢弃 LLM，保留优化后的 ViT）
-        torch.save(raw.image.vit.state_dict(), os.path.join(args.save_dir, "vit_siglip.pth"))
+        _atomic_save(raw.image.vit.state_dict(), os.path.join(args.save_dir, "vit_siglip.pth"))
         # 另存**完整双塔**（ViT + 投影头 + 文本塔 + 可学习温度/偏置）：参考实现只留 ViT，但保留
         # 全模型才能对训好的编码器做**检索评测**（image→text 命中率），否则无从判断对比质量。
-        torch.save(raw.state_dict(), os.path.join(args.save_dir, "siglip_full.pth"))
+        _atomic_save(raw.state_dict(), os.path.join(args.save_dir, "siglip_full.pth"))
         print("SigLIP 对比预训练完成，已保存 vit_siglip.pth（仅视觉编码器）"
               "+ siglip_full.pth（完整双塔，供检索评测）")
     ddp.barrier()

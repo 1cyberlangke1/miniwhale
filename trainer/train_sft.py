@@ -23,12 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
 from model.train import ddp
-from model.train.cli import add_common_args, apply_defaults
+from model.train.cli import add_common_args, apply_defaults, resolve_resume
 from model.train.data import collate_fn, SFTDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
-from model.train.checkpoint import load_resume_ckpt
+from model.train.checkpoint import load_resume_ckpt, save_final
 from model.train.logfile import setup_log_file
 from model.train.loop import (build_loaders_and_steps, run_epochs, update_weights)
 from model.train.dspark_loss import compute_dspark_loss
@@ -58,7 +58,7 @@ def main():
     # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
     args.device = ddp.setup(args.device)
     if ddp.is_main():
-        setup_log_file(args.log_file, append=bool(args.resume))
+        setup_log_file(args.log_file, append=bool(args.resume or args.from_resume))
 
     torch.manual_seed(args.seed)
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
@@ -83,11 +83,12 @@ def main():
                   flush=True)
     # 续训：恢复完整训练状态（模型 + 三优化器动量 + 步数）。优化器在下方才创建，先暂存待回填。
     start_step, resume_ck = 0, None
-    if args.resume:
-        _st = load_resume_ckpt(args.resume, model, args.device)
+    resume_path = resolve_resume(args, "sft")
+    if resume_path:
+        _st = load_resume_ckpt(resume_path, model, args.device)
         start_step = _st["step"]
         resume_ck = _st
-        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
+        print(f"从 {resume_path} 续训，起始 step {start_step}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
     print(f"参数量 {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
 
@@ -181,7 +182,7 @@ def main():
                start_step, epochs_to_run, max_steps)
 
     if ddp.is_main():
-        torch.save(ddp.unwrap(model).state_dict(), os.path.join(args.save_dir, "sft.pth"))
+        save_final(model, args.save_dir, "sft")
         print("SFT 完成，已保存 sft.pth")
     ddp.barrier()
     ddp.cleanup()

@@ -32,6 +32,7 @@ _COMMON_DEFAULTS = {
     "device": None,
     "seed": 42,
     "resume": None,
+    "from_resume": False,
 }
 
 
@@ -72,7 +73,10 @@ def add_common_args(ap: argparse.ArgumentParser):
                     help='torch.compile 模式（固定 "default"）')
     ap.add_argument("--device", default=d["device"])
     ap.add_argument("--seed", type=int, default=d["seed"])
-    ap.add_argument("--resume", default=d["resume"])
+    ap.add_argument("--resume", default=d["resume"],
+                    help="从本阶段中间档续训（恢复模型 + 三优化器动量 + 步数）")
+    ap.add_argument("--from_resume", action="store_true",
+                    help="自动找 --save_dir 下最新的本阶段中间档续训（断电重启后不用手查文件名）")
 
 
 def apply_defaults(args, **overrides):
@@ -94,6 +98,28 @@ def apply_defaults(args, **overrides):
     if args.device is None:
         import torch
         args.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def resolve_resume(args, prefix: str) -> str | None:
+    """解析续训路径：显式 --resume 优先，其次 --from_resume 自动找最新中间档。
+
+    输入：已 parse 的 args；prefix（本阶段的 checkpoint 前缀，如 "sft"）。
+    输出：续训路径或 None。
+    预期行为：--from_resume 时在 --save_dir 下按修改时间找最新 `<prefix>_e*_s*.pth`；
+              找不到则打印提示并返回 None（当作从头训）。显式 --resume 原样返回。
+    """
+    from model.train.checkpoint import find_latest
+
+    if args.resume:
+        return args.resume
+    if not args.from_resume:
+        return None
+    latest = find_latest(args.save_dir, prefix)
+    if latest is None:
+        print(f"--from_resume：{args.save_dir} 下没有 {prefix} 中间档，从头训练", flush=True)
+        return None
+    print(f"--from_resume：自动选中最新中间档 {latest}", flush=True)
+    return latest
 
 
 def resolve_run_mode(ap, args):

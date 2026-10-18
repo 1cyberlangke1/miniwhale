@@ -41,14 +41,21 @@ def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int
     """每个 query 可见的滑窗缓存槽位；-1 表示空槽。
 
     输入：window_size；bsz；seqlen；start_pos；device（**直接在目标设备建张量，避免 CPU→GPU 同步**）。
-    输出：[bsz, seqlen, min(seqlen,window_size)]（prefill）或 [bsz,1,window_size]（decode），int32。
+    输出：[bsz, seqlen, min(seqlen,window_size)]（prefill）或
+          [bsz,1,min(start_pos+1,window_size)]（decode，**只含有效槽**），int32。
     预期行为：缓存是 window_size 个槽的环形缓冲。prefill 每 query 一行、各自因果窗口；
               decode 单 query 看整个环，最旧在前。
+              **decode 在窗口未满时只返回实际写过的槽**（`start_pos+1` 个）：若返回满窗口
+              并在后面补 -1，softmax 归约长度会与 prefill 不同 → bf16 舍入点不同 →
+              增量解码与全量重算逐层漂移（实测 logits 差 4.5）。
     """
     if start_pos == 0:
         end = torch.arange(seqlen, device=device).unsqueeze(1)
         idxs = (end - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size), device=device)
         idxs = torch.where(idxs > end, -1, idxs)
+    elif start_pos + 1 < window_size:
+        # 窗口未满：只用已写入的槽（0..start_pos），归约长度与 prefill 同构
+        idxs = torch.arange(start_pos + 1, device=device)
     else:
         oldest = start_pos % window_size + 1
         idxs = torch.cat([torch.arange(oldest, window_size, device=device),

@@ -42,6 +42,11 @@ def train_epoch(epoch, loader, model, optimizers, args, forward_loss: Callable,
     """
     model.train()
     total_loss, steps = 0.0, 0
+    epoch_t0 = time.time()          # 本 epoch 起点（ETA 用）
+    start_step_of_epoch = start_step
+    # 本 epoch 的结束步：max_steps 给定则用它，否则按 loader 长度估（仅影响 ETA 显示）
+    end_step = (start_step + max_steps if max_steps is not None
+                else start_step + max(len(loader), 1))
     # DDP 防死锁：各 rank 数据量可能不等，先耗尽者若退出循环会让其余 rank 卡在 all_reduce。
     # 数据耗尽时重启迭代器继续，由 max_steps 统一步数（非分布式行为不变）。
     it = iter(loader)
@@ -71,9 +76,15 @@ def train_epoch(epoch, loader, model, optimizers, args, forward_loss: Callable,
         steps += 1
         if gstep % args.log_interval == 0 and ddp.is_main():
             now = time.time()
+            # ETA：按本 epoch 已用时间线性外推（仅打印，不参与调度）
+            spent = now - epoch_t0
+            done = steps - start_step_of_epoch
+            eta_min = (spent / max(done, 1) * (end_step - steps) / 60
+                       if end_step > steps else 0.0)
             print(f"epoch {epoch} step {gstep} loss {total_loss / steps:.4f} "
                   f"lr {optimizers[1].param_groups[0]['lr']:.2e} "
-                  f"{(now - t_step0) * 1000:.0f}ms/step{_fmt_extra(extra)}", flush=True)
+                  f"{(now - t_step0) * 1000:.0f}ms/step{_fmt_extra(extra)} "
+                  f"eta {eta_min:.0f}min", flush=True)
             t_step0 = now
         # 长训练定期存 checkpoint（否则中途崩溃会丢整轮）。**仅 rank0 存**。
         if args.save_interval and (gstep + 1) % args.save_interval == 0:

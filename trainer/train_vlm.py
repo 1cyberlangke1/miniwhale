@@ -26,12 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
 from model.train import ddp
-from model.train.cli import add_common_args, apply_defaults
+from model.train.cli import add_common_args, apply_defaults, resolve_resume
 from model.train.data import collate_fn, MultimodalDataset
 from model.model import Model
 from model.layers.indexer import IndexerLossAutoScaler
 from model.train.compile import maybe_compile
-from model.train.checkpoint import load_resume_ckpt
+from model.train.checkpoint import _atomic_save, load_resume_ckpt
 from model.train.logfile import setup_log_file
 from model.train.loop import (build_loaders_and_steps, run_epochs, update_weights)
 from model.train.optim import make_optimizers
@@ -59,7 +59,7 @@ def main():
     # 导致 `flush=True` 的 print 也到不了文件（攒满 4KB 才吐）。
     # 分布式下只有 rank0 写日志，避免多进程争抢同一文件。
     if ddp.is_main():
-        setup_log_file(args.log_file, append=bool(args.resume))
+        setup_log_file(args.log_file, append=bool(args.resume or args.from_resume))
 
     torch.manual_seed(args.seed)
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
@@ -89,11 +89,12 @@ def main():
     # Sinkhorn 的动量全归零，等于优化器失忆，比不续训好不了多少。优化器在下面才创建，
     # 故此处先暂存 checkpoint，待 make_optimizers 后回填。
     start_step, resume_ck = 0, None
-    if args.resume:
-        _st = load_resume_ckpt(args.resume, model, args.device)
+    resume_path = resolve_resume(args, "vlm")
+    if resume_path:
+        _st = load_resume_ckpt(resume_path, model, args.device)
         start_step = _st["step"]
         resume_ck = _st
-        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
+        print(f"从 {resume_path} 续训，起始 step {start_step}", flush=True)
     model = maybe_compile(model, args.compile, args.compile_mode)
     assert model.vision is not None, "模型未启用视觉塔"
     # **DDP 包装不在此处**：必须在 make_optimizers **之后**。DDP 包装会让
@@ -161,9 +162,9 @@ def main():
     # 存盘只用 rank0；且必须 unwrap（否则 state_dict 键带 `module.` 前缀，与单卡不兼容）。
     if ddp.is_main():
         raw = ddp.unwrap(model)
-        torch.save(raw.state_dict(), os.path.join(args.save_dir, "vlm.pth"))
+        _atomic_save(raw.state_dict(), os.path.join(args.save_dir, "vlm.pth"))
         # ViT 自回归微调阶段（报告 §4.2.2 阶段二）：只保留优化后的视觉编码器，丢弃 LLM
-        torch.save(raw.vision.state_dict(), os.path.join(args.save_dir, "vit_ar.pth"))
+        _atomic_save(raw.vision.state_dict(), os.path.join(args.save_dir, "vit_ar.pth"))
         print("多模态训练完成，已保存 vlm.pth + vit_ar.pth（仅视觉编码器）")
     ddp.barrier()
     ddp.cleanup()

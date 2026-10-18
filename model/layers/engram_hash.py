@@ -137,25 +137,48 @@ class EngramHash(nn.Module):
         self.register_buffer("token_map", torch.tensor(token_map), persistent=False)
 
     @torch.no_grad()
-    def forward(self, input_ids: torch.Tensor, token_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, token_mask: torch.Tensor | None = None,
+                prefix_ids: torch.Tensor | None = None) -> torch.Tensor:
+        """计算 n-gram 哈希（prefill 与增量解码共用）。
+
+        输入：input_ids [B, L]（本次前向的新 token）；token_mask [B, L]（False=图像位置，
+              跳过 Engram）；prefix_ids [B, P]（**decode 时的真实历史**，prefill 传 None）。
+        输出：[B, L, n_layers, n_hash_cols]（int64 行号）。
+        预期行为：n-gram 需要回看前 M-1 个 token。prefill 时历史就在 input_ids 内；
+                  **decode 时 input_ids 只有 1 个 token，必须由 prefix_ids 补上历史**，
+                  否则哈希退化为「单 token + 全 pad」，与全量重算完全不同（实测层1 起
+                  hidden 差 1.4，logits 差 4.5）。
+                  越界（历史不足）与 DEAD 位置都按参考实现规则做前缀 OR 屏蔽。
+        """
         b, L = input_ids.shape
         compressed = self.token_map[input_ids]
         if token_mask is not None:
             compressed = torch.where(token_mask, compressed, torch.full_like(compressed, DEAD))
 
-        # 向量化（等价替换原先的 shift 循环）：一次性建 [1,L,M] 的偏移索引，
-        # 沿 L 维一次 gather 出全部回看位，再对「越界 / DEAD」做**累积 OR** 得到屏蔽位。
-        # 原循环里 `blocked = blocked | ...` 逐 shift 累积，等价于对 bad 做前缀 OR；
-        # 每步 tokens[shift] = where(blocked_shift, pad, source_shift)，故此处直接得到
-        # 同形状 [B,L,M] 的 tokens（m 维顺序与原来 stack 一致：m=0 为最近位）。
         M = self.max_ngram_size
-        positions = torch.arange(L, device=input_ids.device).view(1, L, 1)   # [1, L, 1]
-        shifts = torch.arange(M, device=input_ids.device).view(1, 1, M)      # [1, 1, M]
-        src_pos = positions - shifts                                         # [1, L, M]
-        # source[b,l,m] = compressed[b, clamp(src_pos[l,m])]：expand 出 [B,L,M] 后沿 L 维 gather
-        source = compressed.unsqueeze(-1).expand(b, L, M).gather(
-            1, src_pos.expand(b, L, M).clamp_min(0))
-        bad = (src_pos < 0) | (source == DEAD)                               # [B, L, M]
+        if prefix_ids is None:
+            # prefill：历史在 input_ids 内，用相对位置 gather
+            # 向量化：一次性建 [1,L,M] 的偏移索引，沿 L 维一次 gather 出全部回看位，
+            # 再对「越界 / DEAD」做**累积 OR** 得到屏蔽位（等价于逐 shift 循环）。
+            positions = torch.arange(L, device=input_ids.device).view(1, L, 1)   # [1, L, 1]
+            shifts = torch.arange(M, device=input_ids.device).view(1, 1, M)      # [1, 1, M]
+            src_pos = positions - shifts                                         # [1, L, M]
+            source = compressed.unsqueeze(-1).expand(b, L, M).gather(
+                1, src_pos.expand(b, L, M).clamp_min(0))
+            bad = (src_pos < 0) | (source == DEAD)                               # [B, L, M]
+        else:
+            # decode：把真实历史拼在本次 token 前，再取每个回看位
+            # （按参考实现 `shift_k_prefix`：history = cat(prefix, x)，取 [P-k : P-k+T]）
+            P = prefix_ids.size(1)
+            assert P >= M - 1, f"decode 历史不足：prefix 长度 {P} < n-gram 回看 {M - 1}"
+            hist = self.token_map[prefix_ids]                                    # [B, P]
+            full = torch.cat([hist, compressed], dim=1)                          # [B, P+L]
+            positions = (torch.arange(L, device=input_ids.device) + P).view(1, L, 1)
+            shifts = torch.arange(M, device=input_ids.device).view(1, 1, M)
+            src_pos = positions - shifts                                         # [1, L, M]
+            source = full.unsqueeze(-1).expand(b, P + L, M).gather(
+                1, src_pos.expand(b, L, M).clamp_min(0))
+            bad = (src_pos < 0) | (source == DEAD)
         blocked = bad.int().cumsum(dim=-1) > 0                               # 前缀 OR
         tokens = torch.where(blocked, self.pad_id, source)                   # [B, L, M]
 

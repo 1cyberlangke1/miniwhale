@@ -33,12 +33,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from model.config import ModelConfig
 from model.train import ddp
-from model.train.cli import add_common_args, apply_defaults
+from model.train.cli import add_common_args, apply_defaults, resolve_resume
 from model.train.data import PretrainDataset
 from model.train.dspark_loss import compute_dspark_loss
 from model.model import Model
 from model.train.compile import maybe_compile
-from model.train.checkpoint import load_resume_ckpt, save_checkpoint
+from model.train.checkpoint import load_resume_ckpt, save_checkpoint, save_final
 from model.train.logfile import setup_log_file
 from model.train.scheduler import get_lr
 from model.tokenizer import load_tokenizer
@@ -77,7 +77,7 @@ def main():
     # DDP 初始化（非分布式时为 no-op，返回 --device）。**必须在建模型之前**。
     args.device = ddp.setup(args.device)
     if ddp.is_main():
-        setup_log_file(args.log_file, append=bool(args.resume))
+        setup_log_file(args.log_file, append=bool(args.resume or args.from_resume))
 
     torch.manual_seed(args.seed)
     # 参数保持 **fp32 主权重**（按技术报告 §3.4）；计算走 bf16 autocast。
@@ -119,12 +119,13 @@ def main():
     opt = torch.optim.AdamW(trainable, lr=args.learning_rate, betas=(0.9, 0.95))
     # 续训：恢复完整训练状态（模型 + 优化器动量 + 步数）。只存权重会让 AdamW 一/二阶矩归零。
     start_step = 0
-    if args.resume:
-        _st = load_resume_ckpt(args.resume, model, args.device)
+    resume_path = resolve_resume(args, "dspark")
+    if resume_path:
+        _st = load_resume_ckpt(resume_path, model, args.device)
         start_step = _st["step"]
         if _st["muon"] is not None:
             opt.load_state_dict(_st["muon"])
-        print(f"从 {args.resume} 续训，起始 step {start_step}", flush=True)
+        print(f"从 {resume_path} 续训，起始 step {start_step}", flush=True)
     # DDP 包装：**必须在 freeze_backbone + opt 建立之后**（否则 trainable 列表与按名路由
     # 会带 `module.` 前缀而失效）。DSpark 冻结主干只训 draft 头，梯度同步只覆盖 draft 参数。
     model = ddp.wrap(model)
@@ -184,7 +185,7 @@ def main():
             if ddp.is_main():
                 print(f"checkpoint saved at step {step+1}", flush=True)
     if ddp.is_main():
-        torch.save(ddp.unwrap(model).state_dict(), os.path.join(args.save_dir, "dspark.pth"))
+        save_final(model, args.save_dir, "dspark")
         print("DSpark 训练完成")
     ddp.barrier()
     ddp.cleanup()
