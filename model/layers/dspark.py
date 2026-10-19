@@ -1,6 +1,6 @@
 """DSpark 投机解码（按参考实现 DSparkBlock / DSparkAttention 结构）。
 
-参考实现（DeepSeek-V4.1-Flash 推理实现里的 DSpark* 部分）：
+参考实现（参考模型的 DSpark* 部分）：
 - `DSparkBlock(Block)`：每个 draft stage 是一个**完整 Block**（MLA + MoE + mHC），
   子类化普通 Block，只覆写 attention 与追加 draft 头。
 - 首块有 `main_proj`/`main_norm`：把主干 target 层的 hidden 拼起来投成 draft 输入。

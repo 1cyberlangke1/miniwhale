@@ -464,7 +464,7 @@ class Attention(nn.Module):
         # 参考实现：index 源层无条件读共享槽 shared_attn.index_k（Indexer.forward 的
         # `index_k = shared_attn.index_k[:bsz, : end_pos // ratio]`）。该槽只由「owns_k 且
         # latent 非 None」的层更新（见 _compress_kv），所以组未满的 decode 非压缩步读到的是
-        # 上一层 kv_source 遗留的缓存——猫猫照抄此语义，不直读自己的缓存。
+        # 上一层 kv_source 遗留的缓存——猫猫照这个语义实现，不直读自己的缓存喵。
         end_pos = start_pos + seqlen
         index_k = shared.index_k
         if index_k is None:

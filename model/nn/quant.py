@@ -3,7 +3,7 @@
 参考实现 `act_quant` / `fp4_act_quant` 是 tilelang kernel，做的是"量化→反量化"（inplace 写回）。
 本文件用 torch 复现**同一套公式**，供训练时 QAT（前向量化-反量化、反向直通梯度）。
 
-参考实现公式（DeepSeek-V4.1-Flash 推理实现的 act_quant / fp4_act_quant）：
+参考实现公式（参考模型的 act_quant / fp4_act_quant）：
 - act_quant：amax 逐块、clamp_min(1e-4)；pow2 时 scale = 2^ceil(log2(amax/448))，否则 amax/448；
   clamp(x/s, -448, 448) → fp8(e4m3) → *s。
 - fp4_act_quant：e4m3 scale 时 amax clamp_min(6*2^-9)、s=amax/6；

@@ -46,7 +46,7 @@ class EngramTable(nn.Module):
         输入：indices [...]。
         输出：[..., dim] bf16。
         预期行为：master 权重（fp32）直接查表转 bf16。参考实现推理存 fp8、查表时反量化；
-                  猫猫 master 存反量化后的 fp32，查表即等价（无额外量化）。
+                  猫猫的 master 存反量化后的 fp32，查表即等价（无额外量化）喵。
                   **不在训练时做 QAT**：技术报告的 QAT 只用于 indexer 与主 KV cache，
                   Engram 表是「存 fp8、查表反量化」的推理格式，不是训练机制。
                   若训练时再量化一次会造成训练/eval 数值分叉（训练路径从未被对拍验证）。

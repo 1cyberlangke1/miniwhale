@@ -1,6 +1,6 @@
 """多模态训练（ViT + Aligner + LLM 联合）。
 
-照参考实现 的 VL 接法：图像 → ViT → Aligner → 覆盖图像 span 的 embedding
+按参考实现的 VL 接法：图像 → ViT → Aligner → 覆盖图像 span 的 embedding
 （IMAGE 槽填 aligner 行，start/end/newline 填学习嵌入）→ 主干前向。图像 span 全部携带
 同一 image_token_id，靠 token_types 区分（参考实现机制）。
 

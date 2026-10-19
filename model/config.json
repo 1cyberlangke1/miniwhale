@@ -1,5 +1,5 @@
 {
-  "_comment": "miniwhale 最小档配置 —— 字段名与参考实现 config 一致，只缩尺寸不改结构。目标：8GB 单卡从零训练，验证 V4.1 全部机制。",
+  "_comment": "miniwhale 最小档配置 —— 字段名与参考 config 一致，只缩尺寸不改结构。目标：8GB 单卡从零训练，验证 V4.1 全部机制。",
   "_sizing": "骨干 26.3M + Engram 19.0M（表 15.1M + wkv 投影 3.9M）= 45.3M；prefill 激活 20.7M / decode 24.4M；Engram/骨干 = 0.72",
   "architectures": [
     "MiniwhaleForCausalLM"
@@ -133,7 +133,7 @@
   "_engram_notes": {
     "row_derivation": "每层行数 = Σ_{n-gram阶} Σ_{head} prime_j；素数在所有层间共享 seen（不重复），故各层行数不同。bucket=9728 实测两层 = 235730 / 241278 行",
     "compressed_vocab_size": "必须由 minimind 6400 词表的归一化映射精确算出（NFKC→NFD→StripAccents→Lowercase→空白归一），乘子依赖此值，错了整表哈希失效",
-    "lr": "参考实现 Engram 学习率 ×5",
+    "lr": "Engram 学习率 ×5",
     "grad": "只有被哈希命中的行有梯度（稀疏更新）"
   },
   "_training_plan": {

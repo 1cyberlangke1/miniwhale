@@ -31,7 +31,7 @@ def check_shared_kv(model):
                  if l.attn.compress_ratio and not l.attn.is_kv_source]
     assert sources, "应有 kv_source 层"
     assert consumers, "应有消费层"
-    # 消费层不应自建 compressor（缓存复用，不靠投影）
+    # 消费层不应自建 compressor（靠缓存复用，不靠投影）
     for i in consumers:
         assert model.layers[i].attn.compressor is None, f"层 {i} 不该有 compressor"
     return f"跨层共享：源层 {sources} 发布，消费层 {consumers} 读共享（无投影）✓"

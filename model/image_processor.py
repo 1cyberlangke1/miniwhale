@@ -1,4 +1,4 @@
-"""图像预处理 —— 照参考实现 的 image_processor（纯 torch/PIL/numpy，无外部依赖）。
+"""图像预处理 —— 按参考实现的 image_processor（纯 torch/PIL/numpy，无外部依赖）。
 
 一张图变成：ViT 的 `n_vit_h × n_vit_w` patch 网格，以及 Aligner 3×3 降采样后的
 `n_llm_h × n_llm_w` token 网格。后者在 LLM 里展开成
