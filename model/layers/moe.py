@@ -16,6 +16,22 @@ from torch import nn
 
 from model.nn.norm import RMSNorm  # noqa: F401
 
+# 推理小 batch 走 index_select + bmm（免 `_grouped_mm` 的 CPU 同步）。
+# **默认 False**：bmm 与 grouped_mm 的累加顺序不同，会产生 ~1e-9 偏差，
+# 训练与参考实现逐位对拍必须保持 False。推理入口会置 True。
+_ENABLE_INFER_GATHER = False
+
+
+def enable_infer_gather(enabled: bool = True):
+    """开关推理期的小 batch MoE 路径。
+
+    输入：enabled（True=用 index_select+bmm；False=用 grouped_mm）。
+    输出：无。
+    预期行为：只影响 `eval()` 且 `n_tok*topk <= 8` 的前向；训练路径完全不受影响。
+    """
+    global _ENABLE_INFER_GATHER
+    _ENABLE_INFER_GATHER = enabled
+
 
 class _AuxLossScaler(torch.autograd.Function):
     """把 MoE 序列级平衡损失挂到模块输出上：前向透传，反向以**单位梯度**注入其梯度。
@@ -210,17 +226,72 @@ class MoE(nn.Module):
             self.experts = nn.ModuleList([Expert(self.dim, inter, lim) for _ in range(self.n_routed)])
             self.shared_experts = nn.ModuleList([Expert(self.dim, inter, lim) for _ in range(self.n_shared)])
 
+    def _forward_gather_experts(self, flat, weights, indices, b, L, d, aux_loss):
+        """小 batch 推理路径：**只算 top-k 选中的专家**，用 index_select + bmm。
+
+        输入：flat [n_tok, d]；weights [n_tok, topk]；indices [n_tok, topk]；b/L/d；aux_loss。
+        输出：[b, L, d]。
+        预期行为：稀疏性与 grouped_mm 路径**完全一致**（每个 token 只算它的 top-k 个专家），
+                  区别只在实现：`torch._grouped_mm(offs=...)` 每层要做 3 次 offs 的
+                  DtoH 拷贝 + stream sync（decode 单 token 时整步 24 次，是主要瓶颈）；
+                  这里先 `index_select` 取出被选中的专家权重，再用 `bmm` 逐个算，
+                  不需要任何 CPU 同步。token 少时（n_tok*topk <= 8）权重搬运量可忽略。
+        """
+        n_tok, topk = indices.shape
+        idx = indices.reshape(-1)                              # [N]，N = n_tok*topk
+        xin = flat.repeat_interleave(topk, dim=0).to(flat.dtype)  # [N, d]
+        wd = xin.dtype
+        w1, w2, w3 = self._stacked_weights()
+        w1s = torch.index_select(w1, 0, idx).transpose(1, 2).to(wd)   # [N, d, inter]
+        w3s = torch.index_select(w3, 0, idx).transpose(1, 2).to(wd)
+        w2s = torch.index_select(w2, 0, idx).transpose(1, 2).to(wd)   # [N, inter, d]
+        gate = torch.bmm(xin.unsqueeze(1), w1s).squeeze(1).float()
+        up = torch.bmm(xin.unsqueeze(1), w3s).squeeze(1).float()
+        lim = self.experts[0].swiglu_limit
+        if lim > 0:
+            up = torch.clamp(up, min=-lim, max=lim)
+            gate = torch.clamp(gate, max=lim)
+        h = (F.silu(gate) * up).to(wd)                         # [N, inter]
+        y = torch.bmm(h.unsqueeze(1), w2s).squeeze(1).float()  # [N, d]
+        y = y * weights.reshape(-1).unsqueeze(-1)              # 路由权重
+        tok_ids = torch.arange(n_tok, device=flat.device).repeat_interleave(topk)
+        out = torch.zeros(n_tok, d, device=flat.device, dtype=torch.float32)
+        out.index_add_(0, tok_ids, y)
+        for shared in self.shared_experts:
+            out = out + shared(flat).float()
+        out = out.view(b, L, d).to(flat.dtype)
+        if aux_loss is not None:
+            out = _AuxLossScaler.apply(out, aux_loss)
+        return out
+
     def _stacked_weights(self):
         """把专家权重 stack 成 grouped GEMM 的 3D 权重 [E, N, K]。
 
         输入：无（读 self.experts）。
         输出：(w1 [E, inter, dim], w2 [E, dim, inter], w3 [E, inter, dim])。
-        预期行为：每步 stack 一次（E 很小），供 torch._grouped_mm 使用。
+        预期行为：**推理时缓存**（eval 且权重不变）——每步 stack 12 个张量会多 12 次
+                  kernel launch（8 层合计 96 次/步），在 launch-bound 的 decode 上是纯浪费；
+                  训练时权重每步都更新，必须现 stack。切回 train 会清缓存。
         """
+        if not self.training and getattr(self, "_stack_cache", None) is not None:
+            return self._stack_cache
         w1 = torch.stack([e.w1.weight for e in self.experts])
         w2 = torch.stack([e.w2.weight for e in self.experts])
         w3 = torch.stack([e.w3.weight for e in self.experts])
+        if not self.training:
+            self._stack_cache = (w1, w2, w3)
         return w1, w2, w3
+
+    def train(self, mode: bool = True):
+        """切换训练/推理模式；离开推理模式时清掉专家权重缓存。
+
+        输入：mode。
+        输出：self。
+        预期行为：`eval()` 后缓存 stack 后的专家权重；`train()` 时清空（权重会更新）。
+        """
+        if mode:
+            self._stack_cache = None
+        return super().train(mode)
 
     def forward(self, x: torch.Tensor, image_mask: torch.Tensor | None = None) -> torch.Tensor:
         if self.dense:
@@ -228,11 +299,22 @@ class MoE(nn.Module):
         b, L, d = x.shape
         flat = x.reshape(-1, d)
         weights, indices, aux_loss = self.gate(flat, None if image_mask is None else image_mask.flatten())
+        n_tok, topk = indices.shape
+
+        # **推理小 batch 路径（默认关闭）**：`torch._grouped_mm(offs=...)` 每层要做 3 次
+        # offs 的 DtoH 拷贝 + stream sync（decode 单 token 时整步 24 次）。开启后改用
+        # index_select + bmm——稀疏性完全不变（只算 top-k 选中的专家），只是免掉 CPU 同步。
+        # **默认关闭**：bmm 与 grouped_mm 的累加顺序不同，会与参考实现产生 ~1e-9 的偏差；
+        # 需要逐位一致的对拍/训练路径必须保持关闭。推理入口（`inference/engine.py`）会打开它。
+        # 阈值按 **token 数**（不是 n_tok*topk）：decode 的 1~16 个 token 全部走同一路径，
+        # 避免 T 跨过阈值时切换算法（bmm↔grouped_mm 的累加顺序不同，实测在 T=5 处
+        # 被模型放大到 logits 差 2.25）。prefill 的 L 远大于 16，仍走 grouped_mm。
+        if (not self.training and _ENABLE_INFER_GATHER and n_tok <= 16):
+            return self._forward_gather_experts(flat, weights, indices, b, L, d, aux_loss)
 
         # 生产级稀疏 MoE：token 按专家排列 + grouped GEMM。每个 token 只算它选中的 top-k 个专家
         # （保持稀疏，不把专家 FLOPs 乘 n_routed——全专家张量化是负优化）。argsort / scatter_add /
         # cumsum 输出形状静态，不产生 graph break；grouped GEMM 由 inductor lowering。
-        n_tok, topk = indices.shape
         flat_idx = indices.reshape(-1)                        # [n_tok*topk] 命中的专家 id
         sort_order = torch.argsort(flat_idx, stable=True)     # 按专家排序（长度静态）
         sorted_tok = sort_order // topk                       # 每个 (token,slot) 的 token 行号

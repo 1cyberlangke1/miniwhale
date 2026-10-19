@@ -36,32 +36,71 @@ class SharedAttentionRuntime:
     candidates: torch.Tensor | None = None
 
 
-def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int,
-                         device=None) -> torch.Tensor:
+def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos,
+                         device=None, is_prefill: bool | None = None) -> torch.Tensor:
     """每个 query 可见的滑窗缓存槽位；-1 表示空槽。
 
     输入：window_size；bsz；seqlen；start_pos；device（**直接在目标设备建张量，避免 CPU→GPU 同步**）。
-    输出：[bsz, seqlen, min(seqlen,window_size)]（prefill）或
-          [bsz,1,min(start_pos+1,window_size)]（decode，**只含有效槽**），int32。
+    输出：[bsz, seqlen, min(seqlen,window_size)]（prefill）或 [bsz,1,window_size]（decode），int32。
     预期行为：缓存是 window_size 个槽的环形缓冲。prefill 每 query 一行、各自因果窗口；
-              decode 单 query 看整个环，最旧在前。
-              **decode 在窗口未满时只返回实际写过的槽**（`start_pos+1` 个）：若返回满窗口
-              并在后面补 -1，softmax 归约长度会与 prefill 不同 → bf16 舍入点不同 →
-              增量解码与全量重算逐层漂移（实测 logits 差 4.5）。
+              decode 单 query 看整个环（槽 0..window_size-1，>start_pos 的填 -1），
+              与参考实现 `arange(window_size)` / `F.pad(arange(start_pos+1), ..., -1)` 同序。
+              **decode 固定返回 window_size 个**：长度若随 start_pos 变化，`torch.compile`
+              会因张量形状每步不同而反复重编译（实测生成 60 token 要 200+ 秒）；
+              未写入的槽填 -1，在 softmax 里被 mask 掉，不改变结果。
     """
-    if start_pos == 0:
+    if is_prefill is None:
+        is_prefill = (not torch.is_tensor(start_pos)) and start_pos == 0
+    if is_prefill:
         end = torch.arange(seqlen, device=device).unsqueeze(1)
         idxs = (end - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size), device=device)
         idxs = torch.where(idxs > end, -1, idxs)
-    elif start_pos + 1 < window_size:
-        # 窗口未满：只用已写入的槽（0..start_pos），归约长度与 prefill 同构
-        idxs = torch.arange(start_pos + 1, device=device)
     else:
-        oldest = start_pos % window_size + 1
-        idxs = torch.cat([torch.arange(oldest, window_size, device=device),
-                          torch.arange(oldest, device=device)])
-        idxs = torch.where(idxs > start_pos, -1, idxs)
+        assert seqlen == 1, "多 token decode 走线性窗口路径，不经本函数"
+        idxs = torch.arange(window_size, device=device)
+        idxs = torch.where(idxs <= start_pos, idxs, -1)
     return idxs.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
+
+
+def _pos_freqs(freqs_cis: torch.Tensor, start_pos, seqlen: int, device):
+    """取 [start_pos, start_pos+seqlen) 的 RoPE 频率行。
+
+    输入：freqs_cis [max_seq, rd]；start_pos（int 或 0 维张量）；seqlen；device。
+    输出：[seqlen, rd]。
+    预期行为：张量 start_pos 用 `index_select`（形状固定，可进编译图）；
+              int 用切片（训练/对拍路径，行为不变）。
+    """
+    if torch.is_tensor(start_pos):
+        return freqs_cis.index_select(0, torch.arange(seqlen, device=device) + start_pos.long())
+    return freqs_cis[start_pos:start_pos + seqlen]
+
+
+def _cache_write(buf: torch.Tensor, slot, value: torch.Tensor):
+    """把 value [B,1,D] 写进缓存第 `slot` 个槽。
+
+    输入：buf [B,W,D]；slot（int 或 0 维张量）；value [B,1,D]。
+    输出：无（原地写）。
+    预期行为：int 用直接下标；张量用 `scatter_`（形状固定，可进编译图）。
+    """
+    if torch.is_tensor(slot):
+        buf.scatter_(1, slot.long().view(1, 1, 1).expand(value.size(0), 1, buf.size(-1)), value)
+    else:
+        buf[:, slot] = value[:, 0]
+
+
+def _cache_write_at(buf: torch.Tensor, start, value: torch.Tensor):
+    """把 value [B,T,D] 写进缓存从第 `start` 行起的连续 T 行。
+
+    输入：buf [B,N,D]；start（int 或 0 维张量）；value [B,T,D]。
+    输出：无（原地写）。
+    预期行为：int 用切片；张量用 `scatter_`（形状固定，可进编译图）。
+    """
+    t = value.size(1)
+    if torch.is_tensor(start):
+        idx = (start.long() + torch.arange(t, device=value.device)).view(1, -1, 1)
+        buf.scatter_(1, idx.expand(value.size(0), -1, buf.size(-1)), value)
+    else:
+        buf[:, start:start + t] = value
 
 
 class Attention(nn.Module):
@@ -173,11 +212,33 @@ class Attention(nn.Module):
         if self.compressor is not None:
             self.compressor.reset_state()
 
-    def forward(self, x: torch.Tensor, start_pos: int, shared: SharedAttentionRuntime) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos, shared: SharedAttentionRuntime,
+                is_prefill: bool | None = None, emit_at=None,
+                pos=None) -> torch.Tensor:
+        """一层注意力前向。
+
+        输入：x [B,L,dim]；start_pos（prefill 为 int 0；decode 为位置张量）；
+              shared（跨层共享槽）；is_prefill（None=按 start_pos 推断）；
+              emit_at（本步内凑满压缩组的 token 下标元组；None=按单 token 语义推断）；
+              pos（缓存 scatter 写用的位置张量；None=用 start_pos）。
+        输出：[B,L,dim]。
+        预期行为：显式 is_prefill/emit_at 让分支不依赖 start_pos 的**值**，
+                  否则 torch.compile 会按每个位置的取模结果重复编译；
+                  decode 下形状全程静态（压缩缓存按整块参与，靠 mask 裁剪）。
+        """
         bsz, seqlen, _ = x.size()
         self._ensure_cache(bsz)
         rd = self.rope_head_dim
-        freqs = self.freqs_cis[start_pos:start_pos + seqlen]
+        if is_prefill is None:
+            is_prefill = (not torch.is_tensor(start_pos)) and start_pos == 0
+        if pos is None:
+            pos = start_pos
+        if emit_at is None and not is_prefill:
+            assert not torch.is_tensor(start_pos), "位置为张量时必须显式传 emit_at"
+            cr = self.compress_ratio
+            emit_at = tuple(j for j in range(seqlen)
+                            if cr > 0 and (start_pos + j + 1) % cr == 0)
+        freqs = _pos_freqs(self.freqs_cis, pos, seqlen, x.device)
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
@@ -187,7 +248,7 @@ class Attention(nn.Module):
         kv = apply_rotary_emb(kv, freqs, rd)
         kv = fake_quant_fp8(kv, block_size=32, pow2=True)
         win = self.window_size
-        if start_pos == 0:
+        if is_prefill:
             # 训练/prefill 计算走 kv 本身，同时把 detached 副本写进窗口缓存供后续 decode 读
             if seqlen <= win:
                 with torch.no_grad():
@@ -198,16 +259,42 @@ class Attention(nn.Module):
                     self.window_kv_cache[:bsz, cutoff:win], self.window_kv_cache[:bsz, :cutoff] = \
                         kv[:, -win:].detach().split([win - cutoff, cutoff], dim=1)
             window_kv = kv
+            win_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos, x.device,
+                                            is_prefill=True)
         else:
-            self.window_kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
-            window_kv = self.window_kv_cache[:bsz]
-        win_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos, x.device)
+            if seqlen == 1:
+                # 单 token：槽位用张量 scatter（形状固定，可进编译图）
+                with torch.no_grad():
+                    _cache_write(self.window_kv_cache[:bsz], pos % win,
+                                 kv[:, 0:1].detach())
+                window_kv = self.window_kv_cache[:bsz]
+                win_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos, x.device,
+                                                is_prefill=False)
+            else:
+                # 多 token：一次写 T 行会覆盖块内**更早 query 仍需读取**的旧槽位
+                # （环形缓冲里位置 q 与 q+win 共用槽）。故先按位置顺序把旧窗口取出来，
+                # 再写新行；注意力在「旧窗口 ‖ 本块」的线性缓冲上做因果滑窗。
+                order = (torch.arange(win, device=x.device) + (pos - win)) % win
+                hist = self.window_kv_cache[:bsz].index_select(1, order)
+                with torch.no_grad():
+                    for j in range(seqlen):
+                        _cache_write(self.window_kv_cache[:bsz], (pos + j) % win,
+                                     kv[:, j:j + 1].detach())
+                window_kv = torch.cat([hist, kv], dim=1)
+                # 线性下标 i 对应绝对位置 pos-win+i；query j 的窗口是 i ∈ [j+1, j+win]，
+                # 只需屏蔽 i < win-pos（位置 <0 的越界项）。
+                low = (win - pos).clamp_min(0)
+                base = (torch.arange(win, device=x.device).view(1, 1, win)
+                        + (torch.arange(seqlen, device=x.device) + 1).view(1, seqlen, 1))
+                win_idxs = torch.where(base >= low, base, torch.full_like(base, -1))
+                win_idxs = win_idxs.expand(bsz, -1, -1).contiguous().int()
 
         kv_all = window_kv
         idxs_all = win_idxs
         if self.compress_ratio:
             # 压缩位置索引以窗口实际长度为偏移（kv_all = 窗口 ‖ 压缩）
-            comp_kv, comp_idxs = self._compress_kv(x, qr, start_pos, window_kv.size(1), shared)
+            comp_kv, comp_idxs = self._compress_kv(x, qr, start_pos, window_kv.size(1),
+                                                    shared, is_prefill, emit_at, pos)
             kv_all = torch.cat([kv_all, comp_kv], dim=1)
             idxs_all = torch.cat([idxs_all, comp_idxs], dim=-1)
 
@@ -218,7 +305,7 @@ class Attention(nn.Module):
         # 注意：挂在 rope 输出**之后**——custom Function 的输出不能再被后续原地操作改写。
         if (self.is_index_source and self.indexer is not None
                 and getattr(self.indexer, "_last_score", None) is not None
-                and self.compress_ratio and start_pos == 0):
+                and self.compress_ratio and is_prefill):
             comp_attn = kv_all[:, window_kv.size(1):]          # [B,T,D] 压缩部分
             score = self.indexer._last_score                   # [B,L,T]
             if comp_attn.size(1) > 0 and comp_attn.size(1) == score.size(-1):
@@ -274,18 +361,31 @@ class Attention(nn.Module):
         out = torch.einsum("blhk,blkd->blhd", e.to(q.dtype).float(), k_sel) / sum_exp.unsqueeze(-1)
         return out.to(q.dtype)
 
-    def _compress_kv(self, x, qr, start_pos, offset, shared):
+    def _compress_kv(self, x, qr, start_pos, offset, shared, is_prefill: bool = False,
+                     emit_at=None, pos=None):
         """压缩 KV + 压缩位置索引（CSA 共享在此发生）。
 
-        prefill（训练）：源层算出的 latent 直接作为共享张量发布（带梯度，供后续层读）。
-        decode：写入缓存供跨步复用。
+        输入：x [B,L,dim]；qr；start_pos；offset；shared；is_prefill；
+              emit_at（本步凑满压缩组的 token 下标元组）；pos（位置张量，写缓存用）。
+        输出：(comp_kv [B,T,head_dim], idxs [B,L,K])。
+        预期行为：prefill（训练）源层算出的 latent 直接作为共享张量发布（带梯度，供后续层读）；
+                  decode 写入缓存供跨步复用，并返回**整个缓存**（定长，便于 CUDA Graph）。
+                  多 token 时一次可产出多行 latent（`emit_at` 多项），行号连续。
         """
         bsz, seqlen, _ = x.size()
         ratio = self.compress_ratio
         compress_len = (start_pos + seqlen) // ratio
+        if pos is None:
+            pos = start_pos
+        if is_prefill:
+            compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
+        else:
+            # 每个 query 可见的压缩位置数 = (绝对位置 + 1) // ratio
+            compress_lens = ((pos + 1 + torch.arange(seqlen, device=x.device)) // ratio
+                             ).unsqueeze(-1)
         latent = None
         if self.is_kv_source:
-            latent = self.compressor(x, start_pos)
+            latent = self.compressor(x, pos, is_prefill=is_prefill, emit_at=emit_at)
             # 参考实现：源层把**整个共享 cache** 发布给后续层（非源层按自己的 compress_len 截取）。
             # 推理走此路（逐位一致）；训练用 latent 保留梯度（见下）。
             if not self.training:
@@ -293,54 +393,68 @@ class Attention(nn.Module):
         # 参考实现：shared_attn.index_k 只在「本层 owns_k 且 latent 非 None」时发布
         # （Indexer.forward 内 if self.owns_k and latent is not None）。组未满的 decode
         # 非压缩步 latent=None 不发布，此处读到的是上一层 kv_source 遗留的槽——按参考实现。
-        # prefill 时每个 query 可见的压缩位置数不同（query t 只能看 (t+1)//ratio 个）
-        if start_pos == 0:
-            compress_lens = (torch.arange(1, seqlen + 1, device=x.device) // ratio).unsqueeze(-1)
-        else:
-            compress_lens = compress_len
 
-        # index 源层从自己的 latent 派生 index key（owns_k），供后续层复用
+        # index 源层从自己的 latent 派生 index key（owns_k），供后续层复用。
+        # 发射行的绝对位置：第 j 个 token 凑满组时，缓存行 = (pos+j+1)//ratio - 1，
+        # 多个发射行彼此连续，故可用一次区间写。
+        freqs = None
+        row0 = None
+        if latent is not None and not is_prefill:
+            # 下标张量**缓存**在模块上：捕获期做 H2D 拷贝是非法的（除非 pinned），
+            # 故热身第一次就建好，捕获时直接复用同一块设备内存。
+            if getattr(self, "_emit_idx_key", None) != emit_at:
+                self._emit_idx = torch.tensor(emit_at, device=x.device, dtype=torch.long)
+                self._emit_idx_key = emit_at
+            j_idx = self._emit_idx
+            freqs = self.freqs_cis.index_select(0, (pos + 1 - ratio + j_idx).long())
+            row0 = ((pos + 1 - ratio + j_idx[0]) // ratio)
         if self.is_index_source and latent is not None and self.is_kv_source:
             rd = self.rope_head_dim
             k = self.indexer.k_norm(self.indexer.wk(latent))
-            if start_pos == 0:
-                freqs = self.freqs_cis[: seqlen - seqlen % ratio : ratio]
-            else:
-                freqs = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
-            k = apply_rotary_emb(k, freqs, rd)
+            k_freqs = freqs if not is_prefill else self.freqs_cis[: seqlen - seqlen % ratio : ratio]
+            k = apply_rotary_emb(k, k_freqs, rd)
             # 参考实现：index k 写缓存前做 FP4 量化（fp4_act_quant, block=32, E8M0 scale）
             k = fake_quant_fp4(k, block_size=32)
             if self.training:
                 shared.index_k = k          # 训练：带梯度共享（张量）
             else:
                 # 推理：写缓存并发布**整个缓存**（按参考实现 shared_attn.index_k = self.k_cache）；
-                # 后续 indexer 按 end_pos//ratio 切片，故缓存长度须为 max_seq//ratio。
-                self.index_k_cache[:bsz, start_pos // ratio : start_pos // ratio + k.size(1)] = k
+                # 后续 indexer 按位置切片，故缓存长度须为 max_seq//ratio。
+                _cache_write_at(self.index_k_cache[:bsz],
+                                row0 if not is_prefill else pos // ratio, k)
                 shared.index_k = self.index_k_cache
 
-        idxs = self._compress_topk_idxs(x, qr, latent, start_pos, offset, compress_lens, shared)
+        idxs = self._compress_topk_idxs(x, qr, latent, start_pos, offset, compress_lens,
+                                        shared, is_prefill)
         if latent is not None:
             rd = self.rope_head_dim
-            if start_pos == 0:
-                freqs = self.freqs_cis[: seqlen - seqlen % ratio : ratio]
-            else:
-                freqs = self.freqs_cis[start_pos + 1 - ratio].unsqueeze(0)
-            latent = apply_rotary_emb(latent, freqs, rd)
+            l_freqs = freqs if not is_prefill else self.freqs_cis[: seqlen - seqlen % ratio : ratio]
+            latent = apply_rotary_emb(latent, l_freqs, rd)
             # 参考实现对压缩 latent 做 FP4 量化（fp4_act_quant, block=16, E4M3 scale）
             latent = fake_quant_compressed_kv(latent, block_size=16)
             if self.training:
                 shared.compress_kv = latent   # 训练：带梯度共享给后续层
             else:
                 # 推理：写进 cache（shared.compress_kv 已指向 cache，按参考实现）
-                self.compress_kv_cache[:bsz, start_pos // ratio : start_pos // ratio + latent.size(1)] = latent
+                _cache_write_at(self.compress_kv_cache[:bsz],
+                                row0 if not is_prefill else pos // ratio, latent)
         if shared.compress_kv is None:  # 尚无源层发布（如单独调用本层）
             return x.new_zeros(bsz, 0, self.head_dim), idxs
-        return shared.compress_kv[:bsz, :compress_len], idxs
+        if is_prefill:
+            return shared.compress_kv[:bsz, :compress_len], idxs
+        # decode：返回**整个压缩缓存**（定长）。CUDA Graph 要求形状全程静态，
+        # 按 compress_len 切片会让长度随位置变化；越界位置由 indexer 的
+        # `compress_lens` 掩成 -inf，在 softmax 里 exp=0，对结果无贡献。
+        return shared.compress_kv[:bsz], idxs
 
-    def _compress_topk_idxs(self, x, qr, latent, start_pos, offset, compress_lens, shared):
+    def _compress_topk_idxs(self, x, qr, latent, start_pos, offset, compress_lens, shared,
+                            is_prefill: bool = False):
         """压缩位置的 topk 索引；非 index 源层复用共享结果。
 
-        compress_lens：prefill 时逐 query [L,1]，decode 时标量。
+        输入：x；qr；latent；start_pos；offset；compress_lens（prefill [L,1]，decode 标量）；
+              shared；is_prefill。
+        输出：idxs [B,L,index_topk]，int32（不可达填 -1，其余加 offset）。
+        预期行为：index 源层调用 indexer 打分并发布到 shared.topk_idxs；其余层直接复用。
         """
         bsz, seqlen, _ = x.size()
         if not self.is_index_source:
@@ -360,8 +474,13 @@ class Attention(nn.Module):
             # 参考实现：indexer 的 q 用 attention 层的 freqs_cis（Indexer.freqs_cis = Attention.freqs_cis）
             if self.indexer.freqs_cis is None:
                 self.indexer.freqs_cis = self.freqs_cis
-            # 参考实现：index_k 按本层自己的 end_pos//ratio 切片（非源层读的缓存比它自己的压缩位置多）
-            index_k = index_k[:bsz, : end_pos // self.compress_ratio]
+            # 参考实现：index_k 按本层自己的 end_pos//ratio 切片（非源层读的缓存比它自己的压缩位置多）。
+            # decode 用**整个缓存**（定长）：切片长度随位置变化会破坏 CUDA Graph 的静态形状；
+            # 越界位置由 `compress_lens` 掩成 -inf，对 top-k 无影响。
+            if is_prefill:
+                index_k = index_k[:bsz, : end_pos // self.compress_ratio]
+            else:
+                index_k = index_k[:bsz]
             idxs = self.indexer(x, qr, index_k, compress_lens,
                                 offset, start_pos, shared)
         shared.topk_idxs = idxs

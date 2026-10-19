@@ -38,18 +38,25 @@ class Block(nn.Module):
         self.hc = HyperConnection(text_cfg)
         self.engram = Engram(text_cfg, layer_id) if layer_id in text_cfg.engram_layer_ids else None
 
-    def forward(self, x, start_pos, pre_mix, *attn_args, image_mask=None):
+    def forward(self, x, start_pos, pre_mix, *attn_args, image_mask=None,
+                is_prefill: bool | None = None, emit_at=None, pos=None):
         """attn_args 透传给 attention（普通块传 shared 运行时；DSpark 块传 main_x）。
 
-        输入：x [B,L,hc,dim]；start_pos；pre_mix；attn_args；image_mask [B,L]。
+        输入：x [B,L,hc,dim]；start_pos；pre_mix；attn_args；image_mask [B,L]；
+              is_prefill（显式 prefill/decode 标记；None=按 `start_pos == 0` 推断）；
+              emit_at（本步凑满压缩组的 token 下标元组；None=由 attention 推断）；
+              pos（decode 的位置张量，供缓存 scatter 写；None=用 start_pos）。
         输出：(x, ffn_pre)。
         预期行为：attn 用上一层传的 pre_mix，FFN 用本层 attn 产的 pre_mix（single-pass 错位）。
                   Engram 注入由 Model 在调本块**之前**完成（按参考实现）。
+                  **显式传 is_prefill / emit_at** 是为了让 prefill/decode 分支不依赖
+                  `start_pos` 的值：分支若按 int 判断，torch.compile 会按每个 start_pos 特化。
         """
         residual = x
         attn_pre, attn_post, attn_comb, h = self.hc.hc_mixes_pre(x, pre_mix, "attn")
         h = self.attn_norm(h)
-        h = self.attn(h, start_pos, *attn_args)
+        h = self.attn(h, start_pos, *attn_args, is_prefill=is_prefill,
+                      emit_at=emit_at, pos=pos)
         x = self.hc.hc_post(h, residual, attn_post, attn_comb)
 
         residual = x
@@ -102,7 +109,7 @@ class Model(nn.Module):
             self.image_newline = nn.Parameter(torch.randn(tc.hidden_size) * 0.02)
 
     def forward(self, input_ids, start_pos=0, token_mask=None, images=None, token_types=None,
-                full_logits=True, dspark_train=None, past_ids=None):
+                full_logits=True, dspark_train=None, past_ids=None, is_prefill=None):
         """主干前向（按参考实现 Transformer.forward 的 VL 接口）。
 
         输入：input_ids [B,L]；start_pos；token_mask [B,L]（False=图像位置，Engram 跳过）；
@@ -122,6 +129,8 @@ class Model(nn.Module):
         """
         tc = self.cfg.text
         b, L = input_ids.shape
+        if is_prefill is None:
+            is_prefill = (not torch.is_tensor(start_pos)) and start_pos == 0
         # 跨层共享槽**跨前向持久**（按参考实现：shared_attn 是模块级全局，forward 之间不重置）。
         # 源层每步都会在自己消费者之前写入，故无需重置；decode 的非压缩步正是靠上一前向
         # 遗留的槽（如 index_k）才能逐位一致——重置会破坏这一语义。
@@ -143,7 +152,12 @@ class Model(nn.Module):
                 assert past_ids is not None, (
                     "start_pos>0 时必须传 past_ids（decode 的历史 token），否则 Engram "
                     "n-gram 哈希与全量重算不一致")
-                prefix_ids = past_ids
+                # n-gram 只回看 max_ngram_size-1 个 token，只取尾部 → 形状与 start_pos 无关，
+                # torch.compile 的图全程静态（否则每步一个新长度、每步重编译）。
+                need = self.engram_hash.max_ngram_size - 1
+                assert past_ids.size(1) >= need, (
+                    f"decode 历史不足：{past_ids.size(1)} < n-gram 回看 {need}")
+                prefix_ids = torch.narrow(past_ids, 1, past_ids.size(1) - need, need)
             engram_hashes = self.engram_hash(input_ids, engram_mask, prefix_ids)  # [B,L,n_layers,n_hash_cols]
 
         h = self.embed(input_ids)                       # [B,L,dim]
@@ -155,6 +169,11 @@ class Model(nn.Module):
         pre_mix = h.new_zeros(b, L, self.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
 
+        # decode：位置以**张量**形式参与缓存 scatter 写（形状固定）；切片/长度仍用 int，
+        # 让压缩缓存的可见长度按 `end_pos//ratio` 收缩（按参考实现），不做全缓存 topk。
+        pos = start_pos if is_prefill else torch.tensor(
+            start_pos, device=input_ids.device, dtype=torch.long)
+
         main_hiddens = []  # DSpark 读目标层的注意力输入
         for i, layer in enumerate(self.layers):
             # 参考实现：Engram 注入在层处理**之前**（且先于 main_hiddens 取值）
@@ -164,7 +183,13 @@ class Model(nn.Module):
             # 参考实现：在层处理**之前**取 hc 副本的均值（MTP 读的是注意力输入）
             if i in self.target_layer_ids:
                 main_hiddens.append(h.mean(dim=2))
-            h, pre_mix = layer(h, start_pos, pre_mix, self.shared, image_mask=image_mask)
+            # decode 的压缩组边界由 Python 侧判定（张量进图后不能再按值分支）
+            cr = layer.attn.compress_ratio
+            emit_at = (tuple(j for j in range(L)
+                             if cr > 0 and (start_pos + j + 1) % cr == 0)
+                       if not is_prefill else None)
+            h, pre_mix = layer(h, start_pos, pre_mix, self.shared, image_mask=image_mask,
+                               is_prefill=is_prefill, emit_at=emit_at, pos=pos)
 
         h = self.layers[-1].hc.hc_pre(h, pre_mix)  # 折叠成 1 份
         hidden = self.norm(h)
@@ -180,20 +205,74 @@ class Model(nn.Module):
             return logits, hidden, dspark_out
         return logits, hidden
 
-    def forward_spec(self, input_ids: torch.Tensor, start_pos: int = 0, temperature: float = 0.0):
+    def forward_decode(self, input_ids: torch.Tensor, pos: torch.Tensor,
+                       past_ids: torch.Tensor | None = None, emit_ats=None):
+        """单步（可多 token）解码前向（张量位置 + 全程静态形状；CUDA Graph 的捕获目标）。
+
+        输入：input_ids [1,T]；pos 0 维 int64 张量（**首** token 的绝对位置）；
+              past_ids [1,P]（P >= max_ngram-1，T 个 token 之前的历史）；
+              emit_ats（每层一个元组：本步内凑满压缩组的 token 下标）。
+        输出：(logits [1,T,V], hidden [1,T,dim])。
+        预期行为：**所有与位置有关的量都由 `pos` 张量算出**，不读 Python int——
+                  CUDA Graph 重放时 Python 不再执行，任何被烘焙进图的位置值都会导致
+                  换位置就出错。
+                  **形状全程静态**：压缩/索引缓存按整块参与（越界由 `compress_lens` 掩掉）。
+                  只有 `emit_ats` 这类控制流会被烘焙，调用方按位置奇偶各捕获一张图。
+        """
+        tc = self.cfg.text
+        b, L = input_ids.shape
+        engram_hashes = None
+        if self.engram_hash is not None:
+            need = self.engram_hash.max_ngram_size - 1
+            assert past_ids is not None and past_ids.size(1) >= need, (
+                f"decode 历史不足：{None if past_ids is None else past_ids.size(1)} < {need}")
+            prefix = torch.narrow(past_ids, 1, past_ids.size(1) - need, need)
+            engram_hashes = self.engram_hash(input_ids, None, prefix)
+
+        h = self.embed(input_ids)
+        h = h.unsqueeze(2).expand(-1, -1, self.hc_mult, -1).contiguous()
+        pre_mix = h.new_zeros(b, L, self.hc_mult, dtype=torch.float32)
+        pre_mix[:, :, 0] = 1.0
+
+        main_hiddens = []
+        for i, layer in enumerate(self.layers):
+            if layer.engram is not None and engram_hashes is not None:
+                idx = tuple(tc.engram_layer_ids).index(i)
+                h = layer.engram(h, engram_hashes[:, :, idx, :], None)
+            if i in self.target_layer_ids:
+                main_hiddens.append(h.mean(dim=2))
+            em = emit_ats[i] if emit_ats is not None else None
+            h, pre_mix = layer(h, pos, pre_mix, self.shared, image_mask=None,
+                               is_prefill=False, emit_at=em, pos=pos)
+
+        h = self.layers[-1].hc.hc_pre(h, pre_mix)
+        hidden = self.norm(h)
+        logits = self.head(hidden, full_logits=True)
+        self._last_main_hidden = torch.cat(main_hiddens, dim=-1) if main_hiddens else None
+        return logits, hidden
+
+    def forward_spec(self, input_ids: torch.Tensor, start_pos=0, temperature: float = 0.0,
+                     main_hidden: torch.Tensor | None = None):
         """DSpark draft 前向（参考实现 forward_spec 同构）。
 
-        输入：input_ids [B]（seed token）；start_pos；temperature（0=贪心）。
-        输出：start_pos==0 时 None；否则 (output_ids [B, block+1], logits [B, block, V], confidence [B, block])。
+        输入：input_ids [B]（seed token）；start_pos（int 或位置张量）；
+              temperature（0=贪心）；main_hidden（显式指定 draft 条件 hidden [B,1,D]，
+              投机解码时取**最后一个被接受位置**的 hidden；None=用主干最近一次的输出末位）。
+        输出：None（prefill）或 (output_ids [B, block+1], logits [B, block, V], confidence [B, block])。
         预期行为：用主干 target 层 hidden 投影出 draft 输入，逐 stage 前向出草稿 + 置信度。
+                  位置一律以张量传入，使整条 draft 路径可被 CUDA Graph 捕获。
         """
         assert self.dspark is not None, "模型未启用 DSpark"
-        main_hidden = getattr(self, "_last_main_hidden", None)
-        assert main_hidden is not None, "先调用 forward 以获得主干 target 层 hidden"
-        # decode（start_pos>0）：主干只对上一步 token 前向，取最后一个位置的 hidden
-        if start_pos > 0:
-            main_hidden = main_hidden[:, -1:]
-        return self.dspark(main_hidden, input_ids, start_pos, temperature)
+        prefill = (not torch.is_tensor(start_pos)) and start_pos == 0
+        if main_hidden is None:
+            main_hidden = getattr(self, "_last_main_hidden", None)
+            assert main_hidden is not None, "先调用 forward 以获得主干 target 层 hidden"
+            if not prefill:
+                main_hidden = main_hidden[:, -1:]
+        pos = start_pos if torch.is_tensor(start_pos) else torch.tensor(
+            start_pos, device=input_ids.device, dtype=torch.long)
+        return self.dspark(main_hidden, input_ids, pos, temperature,
+                           is_prefill=prefill, pos=pos)
 
     def encode_image(self, patches, n_vit_h: int, n_vit_w: int):
         """ViT + Aligner：把 patch 网格编码成 Aligner 特征行。

@@ -18,7 +18,7 @@ from functools import lru_cache
 import torch
 from torch import nn
 
-from model.layers.attention import Attention
+from model.layers.attention import Attention, _cache_write, _pos_freqs
 from model.nn.linear import Head, Linear
 from model.nn.norm import RMSNorm
 from model.nn.quant import fake_quant_fp8
@@ -30,19 +30,26 @@ _ATTN_CHUNK = 256
 
 
 @lru_cache(1)
-def get_dspark_topk_idxs(window_size: int, bsz: int, block_size: int, start_pos: int,
+def get_dspark_topk_idxs(window_size: int, bsz: int, block_size: int, start_pos,
                          device=None):
     """draft block 每个 query 可见的 KV 槽位（按参考实现 get_dspark_topk_idxs）。
 
-    输入：window_size；bsz；block_size；start_pos（>0）；device（**直接在目标设备建张量**）。
-    输出：[bsz, block_size, min(win, start_pos+1)+block_size]，int32。
+    输入：window_size；bsz；block_size；start_pos（>0，int 或 0 维张量）；device。
+    输出：[bsz, block_size, window_size+block_size]，int32。
     预期行为：每个 draft query 看 [窗口内历史槽 … | 本块 block_size 个槽]。
+              **长度恒为 window_size+block_size**（不随 start_pos 收缩）：
+              序列不足一个窗口时，未写入的槽填 -1（在 softmax 里被屏蔽），
+              这样 CUDA Graph 的形状全程静态。
     """
-    assert start_pos > 0
-    matrix = torch.cat([
-        torch.arange(min(window_size, start_pos + 1), device=device),
-        window_size + torch.arange(block_size, device=device),
-    ])
+    idx = torch.arange(window_size, device=device)
+    if torch.is_tensor(start_pos):
+        # 图路径：长度必须静态（win+block），未写入的槽填 -1，由 softmax 屏蔽
+        idx = torch.where(idx <= start_pos, idx, -1)
+    else:
+        # 对拍/训练路径：保持参考实现长度 min(win, start_pos+1)，逐位一致
+        assert start_pos > 0
+        idx = idx[:min(window_size, start_pos + 1)]
+    matrix = torch.cat([idx, window_size + torch.arange(block_size, device=device)])
     return matrix.int().view(1, 1, -1).expand(bsz, block_size, -1).contiguous()
 
 
@@ -221,19 +228,34 @@ class DSparkAttention(Attention):
         o = torch.einsum("bqgd,grd->bqgr", o, wo_a)
         return self.wo_b(o.flatten(2).to(self.wo_b.weight.dtype))
 
-    def forward(self, x: torch.Tensor, start_pos: int, main_x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos, main_x: torch.Tensor,
+                is_prefill: bool | None = None, pos=None) -> torch.Tensor:
+        """draft 注意力前向。
+
+        输入：x [B,block,dim]；start_pos（prefill 为 int 0，decode 为位置张量）；
+              main_x [B,S,dim]（主干 target hidden）；is_prefill（None=按 start_pos 推断）；
+              pos（位置张量，缓存写用；None=用 start_pos）。
+        输出：[B,block,dim]。
+        预期行为：prefill 只把 main_x 灌进窗口缓存；decode 用 main_x（位置 pos）
+                  与整块 draft token 一起做稀疏注意力。全程用张量位置、静态形状，
+                  使整块 draft 可被 CUDA Graph 捕获。
+        """
         assert self.compress_ratio == 0, "DSpark 层必须是纯 SWA（compress_ratio=0）"
         bsz, seqlen, _ = main_x.size()
         win, rd = self.window_size, self.rope_head_dim
+        if is_prefill is None:
+            is_prefill = (not torch.is_tensor(start_pos)) and start_pos == 0
+        if pos is None:
+            pos = start_pos
 
         # main_x（主干 target hidden）→ 窗口 KV；参考实现对 KV 做 FP8 量化
-        main_freqs = self.freqs_cis[start_pos:start_pos + seqlen]
+        main_freqs = _pos_freqs(self.freqs_cis, pos, seqlen, x.device)
         main_kv = self.kv_norm(self.wkv(main_x))
         main_kv = apply_rotary_emb(main_kv, main_freqs, rd)
         main_kv = fake_quant_fp8(main_kv, block_size=32, pow2=True)
 
         self._ensure_cache(bsz)
-        if start_pos == 0:  # prefill：只把 main_x 灌进窗口缓存，不产出 draft
+        if is_prefill:  # prefill：只把 main_x 灌进窗口缓存，不产出 draft
             if seqlen <= win:
                 with torch.no_grad():
                     self.window_kv_cache[:bsz, :seqlen] = main_kv.detach()
@@ -246,7 +268,7 @@ class DSparkAttention(Attention):
 
         # decode：draft block 并行前向
         bsz, block_size, _ = x.size()
-        freqs = self.freqs_cis[start_pos + seqlen:start_pos + seqlen + block_size]
+        freqs = _pos_freqs(self.freqs_cis, pos + seqlen, block_size, x.device)
 
         qr = self.q_norm(self.wq_a(x))
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
@@ -255,9 +277,9 @@ class DSparkAttention(Attention):
         kv = apply_rotary_emb(kv, freqs, rd)
         kv = fake_quant_fp8(kv, block_size=32, pow2=True)
 
-        topk_idxs = get_dspark_topk_idxs(win, bsz, block_size, start_pos, x.device)
+        topk_idxs = get_dspark_topk_idxs(win, bsz, block_size, pos, x.device)
         with torch.no_grad():
-            self.window_kv_cache[:bsz, start_pos % win] = main_kv.squeeze(1).detach()
+            _cache_write(self.window_kv_cache[:bsz], pos % win, main_kv[:, :1].detach())
         kv = torch.cat([self.window_kv_cache[:bsz], kv], dim=1)
 
         o = self._sparse_attn(q, kv, topk_idxs)
@@ -387,11 +409,11 @@ class DSparkBlock(nn.Module):
         x = self.hc.hc_post(h, residual, ffn_post, ffn_comb)
         return x, ffn_pre
 
-    def forward(self, x, start_pos, pre_mix, main_x):
+    def forward(self, x, start_pos, pre_mix, main_x, is_prefill=None, pos=None):
         residual = x
         attn_pre, attn_post, attn_comb, h = self.hc.hc_mixes_pre(x, pre_mix, "attn")
         h = self.attn_norm(h)
-        h = self.attn(h, start_pos, main_x)
+        h = self.attn(h, start_pos, main_x, is_prefill=is_prefill, pos=pos)
         x = self.hc.hc_post(h, residual, attn_post, attn_comb)
 
         residual = x
@@ -438,35 +460,44 @@ class DSparkHead(nn.Module):
         temperature=0 为贪心（argmax）；>0 用 Gumbel-max 采样（参考实现 sample 同款）。
         """
         last = self.mtp[-1]
-        x = last.hc.hc_pre(x, pre_mix)
+        x = last.hc.hc_pre(x, pre_mix)                         # [B, block, dim]
         base_logits = self.head(last.norm(x))                  # [B, block, V]
-        # 逐位置用 markov 偏置修正并采样；id 用列表收集（避免原地写入破坏计算图）
-        ids_list = [input_ids]
-        logits_list, markov_embeds = [], []
+        # 逐位置加 markov 偏置并采样。**不用原地写**：`nn.Embedding` 反向要保存索引张量，
+        # 原地改 `output_ids` 会让 autograd 报 version counter 错；用列表收集再 stack，
+        # 数值与参考实现 `logits[:, i].add_(bias)` 完全一致。
+        ids_list = [input_ids.view(-1)]
+        step_logits, markov_embeds = [], []
         for i in range(self.block_size):
-            bias, me = last.markov_head(ids_list[i])
-            step_logits = base_logits[:, i] + bias             # 非原地
-            logits_list.append(step_logits)
-            markov_embeds.append(me)
-            ids_list.append(_sample(step_logits, temperature))
-        logits = torch.stack(logits_list, dim=1)               # [B, block, V]
+            logits_bias, markov_embed = last.markov_head(ids_list[i])   # [B,V] / [B,rank]
+            cur = base_logits[:, i] + logits_bias
+            step_logits.append(cur)
+            markov_embeds.append(markov_embed)
+            ids_list.append(_sample(cur, temperature))
+        logits = torch.stack(step_logits, dim=1)               # [B, block, V]
         output_ids = torch.stack(ids_list, dim=1)              # [B, block+1]
-        markov_embed = torch.stack(markov_embeds, dim=1)
+        markov_embed = torch.stack(markov_embeds, dim=1)       # [B, block, rank]
+        # 参考实现：confidence 用 **未归一化** 的 hc_pre 输出 x
         confidence = last.confidence_head(x, markov_embed)
         return output_ids, logits, confidence
 
-    def forward(self, main_hidden, input_ids, start_pos: int = 0, temperature: float = 0.0):
+    def forward(self, main_hidden, input_ids, start_pos=0, temperature: float = 0.0,
+                is_prefill: bool | None = None, pos=None):
         """draft 前向（prefill 只填缓存，decode 出草稿）。
 
-        输入：main_hidden [B, S, D]；input_ids [B]；start_pos；temperature（0=贪心）。
-        输出：start_pos==0 时 None；否则 (output_ids, logits, confidence)。
+        输入：main_hidden [B, S, D]；input_ids [B]；start_pos（prefill 为 int 0，
+              decode 可为位置张量）；temperature（0=贪心）；is_prefill（None=按 start_pos 推断）；
+              pos（位置张量，缓存写用；None=用 start_pos）。
+        输出：prefill 时 None；否则 (output_ids, logits, confidence)。
         """
         x, main_x = self.forward_embed(main_hidden, input_ids)
         pre_mix = x.new_zeros(x.size(0), x.size(1), self.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
         for layer in self.mtp:
-            x, pre_mix = layer(x, start_pos, pre_mix, main_x)
-        if start_pos == 0:
+            x, pre_mix = layer(x, start_pos, pre_mix, main_x,
+                               is_prefill=is_prefill, pos=pos)
+        if is_prefill is None:
+            is_prefill = (not torch.is_tensor(start_pos)) and start_pos == 0
+        if is_prefill:
             return None
         return self.forward_head(x, pre_mix, input_ids, temperature)
 

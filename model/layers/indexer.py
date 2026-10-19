@@ -84,13 +84,25 @@ class Indexer(nn.Module):
 
     def score(self, x: torch.Tensor, qr: torch.Tensor, index_k: torch.Tensor,
               start_pos: int = 0) -> torch.Tensor:
-        """算每个 query 对每个压缩位置的分数。x [B,L,dim] → [B,L,T]。"""
+        """算每个 query 对每个压缩位置的分数。
+
+        输入：x [B,L,dim]；qr [B,L,q_lora_rank]；index_k [B,T,index_head_dim]；
+              start_pos（prefill int 0；decode 可为 0 维张量）。
+        输出：[B,L,T]。
+        预期行为：q 施加 RoPE（取 [start_pos, start_pos+L) 的频率行）并 FP4 量化，
+                  与量化后的 index_k 做逐头点积，ReLU 后按 head 权重加权求和。
+        """
         dtype = x.dtype
         q = self.wq_b(qr.to(self.wq_b.weight.dtype)).unflatten(-1, (self.n_heads, self.index_head_dim)).to(dtype)
         # 参考实现：对 indexer 的 q 施加 RoPE（末 rope_head_dim 维）
         if self.freqs_cis is not None:
             seqlen = q.size(1)
-            q = apply_rotary_emb(q, self.freqs_cis[start_pos:start_pos + seqlen], self.rope_head_dim)
+            if torch.is_tensor(start_pos):
+                freqs = self.freqs_cis.index_select(
+                    0, start_pos.long() + torch.arange(seqlen, device=x.device))
+            else:
+                freqs = self.freqs_cis[start_pos:start_pos + seqlen]
+            q = apply_rotary_emb(q, freqs, self.rope_head_dim)
         # 参考实现对 indexer 的 q/k 做 FP4 量化（fp4_act_quant, block=32, E8M0 scale）
         q = fake_quant_fp4(q, block_size=32)
         weights = self.weights_proj(x.to(self.weights_proj.weight.dtype)).to(dtype) \

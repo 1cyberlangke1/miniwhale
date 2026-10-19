@@ -53,16 +53,35 @@ class Compressor(nn.Module):
             self.kv_state.zero_()
             self.score_state.fill_(-torch.inf)
 
-    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor | None:
+    def forward(self, x: torch.Tensor, start_pos=0, is_prefill: bool | None = None,
+                emit_at=None) -> torch.Tensor | None:
+        """把输入压成 KV latent。
+
+        输入：x [B,L,dim]；start_pos（prefill 为 int 0，decode 可为 0 维张量）；
+              is_prefill（None=按 `start_pos` 推断；显式传可避免按值特化）；
+              emit_at（decode 专用：本步内**凑满整组**的 token 下标元组，如 (1, 3)；
+                       None=按单 token 语义推断；空元组=本步不产出 latent）。
+        输出：latent [B,m,head_dim]（m=len(emit_at)），m==0 时返回 None。
+        预期行为：prefill 把整段按 ratio 分组池化，尾组缓存；
+                  decode 逐 token 写进环形状态，遇到 emit_at 里的下标就池化产出一行。
+                  **按 token 展开（Python 循环）而非沿 T 维并行**：池化必须按组边界
+                  顺序发生；展开后对给定 T 形状与控制流完全静态，可被 CUDA Graph 捕获。
+        """
         bsz, seqlen, _ = x.size()
         ratio, dtype = self.compress_ratio, x.dtype
+
+        if is_prefill is None:
+            is_prefill = (not torch.is_tensor(start_pos)) and start_pos == 0
+        if emit_at is None:
+            assert not torch.is_tensor(start_pos), "张量 start_pos 必须显式传 emit_at"
+            emit_at = (0,) if (start_pos + 1) % ratio == 0 else ()
 
         if ratio == 1:  # 一个 token 一组，无需池化
             return self.norm(self.wkv(x))
 
         x = x.float()
         kv, score = self.wkv(x), self.wgate(x)
-        if start_pos == 0:
+        if is_prefill:
             should_compress = seqlen >= ratio
             remainder = seqlen % ratio
             cutoff = seqlen - remainder
@@ -72,13 +91,27 @@ class Compressor(nn.Module):
             kv = kv.unflatten(1, (-1, ratio))
             score = score.unflatten(1, (-1, ratio))
             kv = (kv * score.softmax(dim=2)).sum(dim=2)
-        else:  # decode：填一格，组满才池化
-            should_compress = (start_pos + 1) % ratio == 0
-            slot = start_pos % ratio
-            self.kv_state[:bsz, slot] = kv.squeeze(1)
-            self.score_state[:bsz, slot] = score.squeeze(1)
-            if should_compress:
-                kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
-        if not should_compress:
+            if not should_compress:
+                return None
+            return self.norm(kv.to(dtype))
+
+        # decode：逐 token 填格，凑满整组时池化
+        out = []
+        for j in range(seqlen):
+            slot = (start_pos + j) % ratio
+            kv_j, score_j = kv[:, j:j + 1], score[:, j:j + 1]
+            if torch.is_tensor(slot):
+                # 张量槽位用 scatter（形状固定，可进编译图）
+                self.kv_state.scatter_(
+                    1, slot.long().view(1, 1, 1).expand(bsz, 1, self.head_dim), kv_j)
+                self.score_state.scatter_(
+                    1, slot.long().view(1, 1, 1).expand(bsz, 1, self.head_dim), score_j)
+            else:
+                self.kv_state[:bsz, slot] = kv_j[:, 0]
+                self.score_state[:bsz, slot] = score_j[:, 0]
+            if j in emit_at:
+                out.append((self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1))
+                           .sum(dim=1, keepdim=True))
+        if not out:
             return None
-        return self.norm(kv.to(dtype))
+        return self.norm(torch.cat(out, dim=1).to(dtype))
